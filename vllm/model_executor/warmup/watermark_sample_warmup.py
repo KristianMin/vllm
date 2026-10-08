@@ -109,14 +109,15 @@ def watermark_sample_warmup(worker: Worker) -> None:
             device=device,
         )
         # Dtypes mirror the runtime buffers the sampler passes and are part of
-        # the specialization key: int32 request-state token ids, int64 index and
-        # seed buffers, fp32 sampling temperatures.
+        # the specialization key: int32 request-state token ids and index
+        # mapping (the model runner builds ``idx_mapping`` as int32), int64 seed
+        # and position buffers, fp32 sampling temperatures.
         sampling_state = {
             "skip_mask": torch.zeros(
                 _NUM_WARMUP_TOKENS, dtype=torch.bool, device=device
             ),
             "expanded_idx_mapping": torch.zeros(
-                _NUM_WARMUP_TOKENS, dtype=torch.int64, device=device
+                _NUM_WARMUP_TOKENS, dtype=torch.int32, device=device
             ),
             "temperatures": torch.ones(
                 _NUM_WARMUP_TOKENS, dtype=torch.float32, device=device

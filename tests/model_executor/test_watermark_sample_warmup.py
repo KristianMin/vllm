@@ -240,10 +240,12 @@ def test_dedup_none_also_warms_the_mask_free_specialization(
 def test_warmup_argument_dtypes_match_the_runtime_buffers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Contexts are int32, the sampling state int64 indices and fp32 temperatures.
+    """Contexts and the index mapping are int32, positions and seeds int64 and
+    temperatures fp32.
 
     ``GPUWatermarkSampler._get_contexts`` gathers from the int32 request-state
-    token ids, ``expanded_idx_mapping``/``positions``/``seeds`` are int64 and
+    token ids, the model runner builds ``idx_mapping`` (and so
+    ``expanded_idx_mapping``) as int32, ``positions``/``seeds`` are int64 and
     ``SamplingStates.temperature`` is fp32; warming other dtypes compiles
     specializations no engine launches.
     """
@@ -256,7 +258,7 @@ def test_warmup_argument_dtypes_match_the_runtime_buffers(
         assert call["contexts"].dtype == torch.int32
         assert call["contexts"].shape == (num_tokens, 3)
         assert call["skip_mask"].dtype == torch.bool
-        assert call["expanded_idx_mapping"].dtype == torch.int64
+        assert call["expanded_idx_mapping"].dtype == torch.int32
         assert call["positions"].dtype == torch.int64
         assert call["seeds"].dtype == torch.int64
         assert call["temperatures"].dtype == torch.float32
