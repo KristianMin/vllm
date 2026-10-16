@@ -196,6 +196,31 @@ vllm serve MODEL \
   --watermark-config '{"algorithm":"dual_key_gumbel","key":42,"alpha":0.1}'
 ```
 
+`DualKeyGumbelWatermarkDetector` also provides the entropy-weighted and
+localized detection of [TextSeal](https://arxiv.org/abs/2605.12456). Both take
+optional per-token entropies, where `entropies[t]` is the entropy of the
+next-token distribution that produced token `t`, as computed by the generating
+model or a proxy model. With entropies, `detect` runs the entropy-weighted
+test instead of the unweighted one: it gives less weight to low-entropy tokens,
+which carry little watermark. `detect_localized` also tests windows of the
+text, so it can detect watermarked passages inside other text, and reports
+where they are:
+
+```python
+from vllm.v1.watermarking import DualKeyGumbelWatermarkDetector
+
+detector = DualKeyGumbelWatermarkDetector(key=42, alpha=0.1)
+weighted = detector.detect(token_ids, entropies=entropies)
+localized = detector.detect_localized(token_ids, entropies=entropies)
+print(localized.p_value, localized.regions)
+```
+
+`regions` lists the watermarked spans as `(start, end, p_value)` token
+positions, `end` exclusive. It is empty when the test of the whole text gives
+the smallest p-value. The localized p-value is corrected for the number of
+windows and tests tried. Without entropies, `detect_localized` runs only the
+unweighted tests.
+
 ### SynthID-Text
 
 [SynthID-Text](https://www.nature.com/articles/s41586-024-08025-4) is planned but
