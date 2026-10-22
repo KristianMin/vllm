@@ -124,6 +124,47 @@ def test_dual_key_alpha_defaults_match():
     assert detector.alpha == watermarker.alpha == config.alpha
 
 
+def test_dual_key_weighted_detection_with_equal_entropies_matches_unweighted():
+    # The contexts (1, 2, 3, 4) and (2, 3, 4, 5) repeat and are scored once.
+    token_ids = [1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 6]
+    detector = DualKeyGumbelWatermarkDetector(key=42, alpha=0.1)
+
+    unweighted = detector.detect(token_ids)
+    weighted = detector.detect(token_ids, entropies=[2.0] * len(token_ids))
+
+    assert weighted.num_scored_tokens == unweighted.num_scored_tokens == 9
+    assert weighted.p_value == pytest.approx(unweighted.p_value)
+
+
+def test_dual_key_weighted_detection_needs_an_entropy_per_token():
+    detector = DualKeyGumbelWatermarkDetector(key=42)
+
+    with pytest.raises(ValueError, match="one value per token"):
+        detector.detect([1, 2, 3], entropies=[1.0, 2.0])
+
+
+def test_dual_key_localized_detection_finds_a_watermarked_passage():
+    detector = DualKeyGumbelWatermarkDetector(key=42, alpha=0.1)
+    generator = torch.Generator().manual_seed(0)
+    unwatermarked = torch.randint(0, 1000, (400,), generator=generator).tolist()
+    # Tokens 200-299 maximize the key-A uniform among 256 candidates, as
+    # Gumbel-max samples them from a flat distribution.
+    token_ids = unwatermarked[:200]
+    candidates = torch.arange(256)
+    for _ in range(100):
+        context = torch.tensor([token_ids[-detector.context_width :]])
+        token_ids.append(int(detector.prf.uniform(context, candidates).argmax()))
+    token_ids += unwatermarked[200:]
+
+    result = detector.detect_localized(token_ids)
+
+    assert result.is_watermarked
+    assert result.winner.startswith("localized")
+    assert result.regions
+    assert all(start < 300 and end > 200 for start, end, _ in result.regions)
+    assert all(result.token_labels[210:290])
+
+
 @pytest.mark.skipif(
     not current_platform.is_cuda_alike(), reason="requires a CUDA-like accelerator"
 )

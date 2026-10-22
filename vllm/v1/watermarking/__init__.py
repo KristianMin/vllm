@@ -20,6 +20,7 @@ from vllm.v1.watermarking.gumbel import (
     GumbelWatermarkDetector,
     GumbelWatermarker,
 )
+from vllm.v1.watermarking.localized import LocalizedWatermarkDetection
 from vllm.v1.watermarking.lookahead import (
     LookaheadDualKeyGumbelWatermarker,
     LookaheadGaussianCopulaWatermarker,
@@ -84,6 +85,7 @@ __all__ = [
     "LookaheadTextGrainWatermarker",
     "PPLHardWatermarker",
     "PPLSoftWatermarker",
+    "LocalizedWatermarkDetection",
     "PhiloxPRF",
     "RotationFirstWatermarkDetector",
     "RotationFirstWatermarker",
