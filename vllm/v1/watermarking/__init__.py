@@ -20,7 +20,13 @@ from vllm.v1.watermarking.gumbel import (
     GumbelWatermarkDetector,
     GumbelWatermarker,
 )
-from vllm.v1.watermarking.lookahead import LookaheadGumbelWatermarker
+from vllm.v1.watermarking.lookahead import (
+    LookaheadDualKeyGumbelWatermarker,
+    LookaheadGaussianCopulaWatermarker,
+    LookaheadGumbelWatermarker,
+)
+from vllm.v1.watermarking.lookahead_ppl import LookaheadPPLSoftWatermarker
+from vllm.v1.watermarking.lookahead_textgrain import LookaheadTextGrainWatermarker
 from vllm.v1.watermarking.multibit_red_green import (
     MultibitRedGreenWatermarkDetector,
     MultibitRedGreenWatermarker,
@@ -71,7 +77,11 @@ __all__ = [
     "MultibitRedGreenWatermarkDetector",
     "MultibitRedGreenWatermarker",
     "MultibitWatermarkDetection",
+    "LookaheadDualKeyGumbelWatermarker",
+    "LookaheadGaussianCopulaWatermarker",
     "LookaheadGumbelWatermarker",
+    "LookaheadPPLSoftWatermarker",
+    "LookaheadTextGrainWatermarker",
     "PPLHardWatermarker",
     "PPLSoftWatermarker",
     "PhiloxPRF",

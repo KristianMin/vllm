@@ -13,7 +13,13 @@ from vllm.v1.watermarking.gumbel import (
     DualKeyGumbelWatermarker,
     GumbelWatermarker,
 )
-from vllm.v1.watermarking.lookahead import LookaheadGumbelWatermarker
+from vllm.v1.watermarking.lookahead import (
+    LookaheadDualKeyGumbelWatermarker,
+    LookaheadGaussianCopulaWatermarker,
+    LookaheadGumbelWatermarker,
+)
+from vllm.v1.watermarking.lookahead_ppl import LookaheadPPLSoftWatermarker
+from vllm.v1.watermarking.lookahead_textgrain import LookaheadTextGrainWatermarker
 from vllm.v1.watermarking.multibit_red_green import MultibitRedGreenWatermarker
 from vllm.v1.watermarking.perplexity import PPLHardWatermarker, PPLSoftWatermarker
 from vllm.v1.watermarking.red_green import RedGreenWatermarker, UnigramWatermarker
@@ -75,6 +81,33 @@ def create_watermarker(
             config.aggregator,
             config.aggregator_lambda,
         )
+    if config.algorithm == "lookahead_dual_key_gumbel":
+        return LookaheadDualKeyGumbelWatermarker(
+            config.key,
+            config.context_width,
+            config.prf,
+            config.alpha,
+            config.aggregator,
+            config.aggregator_lambda,
+        )
+    if config.algorithm == "lookahead_gaussian_copula":
+        return LookaheadGaussianCopulaWatermarker(
+            config.key,
+            config.context_width,
+            config.prf,
+            config.correlation,
+            config.aggregator,
+            config.aggregator_lambda,
+        )
+    if config.algorithm == "lookahead_ppl_soft":
+        return LookaheadPPLSoftWatermarker(
+            config.key,
+            config.context_width,
+            config.prf,
+            config.epsilon,
+            config.aggregator,
+            config.aggregator_lambda,
+        )
     if config.algorithm == "chi_squared":
         return ChiSquaredWatermarker(
             config.key, config.context_width, config.prf, **delta
@@ -103,6 +136,16 @@ def create_watermarker(
             config.entropy_budget,
             config.num_blocks,
             config.num_columns,
+        )
+    if config.algorithm == "lookahead_textgrain":
+        return LookaheadTextGrainWatermarker(
+            config.key,
+            config.context_width,
+            config.prf,
+            config.entropy_budget,
+            config.num_blocks,
+            config.num_columns,
+            config.lookahead_reward_samples,
         )
     if config.algorithm == "gaussian_copula":
         return GaussianCopulaWatermarker(

@@ -56,6 +56,8 @@ def _philox_sampler_keys(watermarker: Watermarker) -> list[int]:
     """Philox keys the sampler launches the kernel with."""
     from vllm.v1.watermarking.gumbel import DualKeyGumbelWatermarker
 
+    # Lookahead variants of other watermarks sample with them.
+    watermarker = getattr(watermarker, "sampling_watermarker", watermarker)
     watermarkers: list[Watermarker] = [watermarker]
     if isinstance(watermarker, DualKeyGumbelWatermarker):
         # ``DualKeyGumbelWatermarker.sample`` launches once per key, and
@@ -78,6 +80,7 @@ def _philox_gaussian_copula_args(watermarker: Watermarker) -> tuple[int, float] 
     from vllm.v1.watermarking.gaussian_copula import GaussianCopulaWatermarker
     from vllm.v1.watermarking.prfs import PhiloxPRF
 
+    watermarker = getattr(watermarker, "sampling_watermarker", watermarker)
     if not isinstance(watermarker, GaussianCopulaWatermarker):
         return None
     prf = watermarker.prf

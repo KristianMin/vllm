@@ -19,6 +19,10 @@ WatermarkingAlgorithm = Literal[
     "unigram",
     "multibit_red_green",
     "lookahead_gumbel",
+    "lookahead_dual_key_gumbel",
+    "lookahead_gaussian_copula",
+    "lookahead_ppl_soft",
+    "lookahead_textgrain",
     "chi_squared",
     "ppl_hard",
     "ppl_soft",
@@ -28,7 +32,12 @@ WatermarkingAlgorithm = Literal[
     "rotation_first",
     "concordmark",
 ]
-LookaheadAggregator = Literal["pi1", "pi2", "max", "tsum", "min", "lin", "expsum"]
+LookaheadAggregator = Literal[
+    "pi1", "pi2", "max", "tsum", "min", "lin", "expsum", "gauss", "optpath"
+]
+# The aggregators each lookahead algorithm implements.
+LOOKAHEAD_GUMBEL_AGGREGATORS = ("pi1", "pi2", "max", "tsum", "min", "lin", "expsum")
+LOOKAHEAD_PPL_AGGREGATORS = ("pi1", "pi2", "tsum", "max", "gauss", "optpath")
 WatermarkPRFName = Literal["philox"]
 WatermarkContextScope = Literal["none", "single_turn", "all"]
 
@@ -69,12 +78,24 @@ class WatermarkConfig:
     message_bits: int = Field(default=16, ge=1, le=24)
     """Number of message bits embedded by multi-bit red-green watermarking."""
     aggregator: LookaheadAggregator = "tsum"
-    """How lookahead Gumbel-max combines a drafted token's own Gumbel with the
-    race value of the row below it: `pi1` is plain Gumbel-max, `pi2` takes the
-    child's value, `max`, `tsum`, `min`, `lin` and `expsum` mix both while
-    keeping the result a standard Gumbel."""
+    """How a lookahead watermark combines a drafted token's own randomness with
+    what the row below sends up. `lookahead_gumbel`, `lookahead_dual_key_gumbel`
+    and `lookahead_gaussian_copula`: `pi1` is the plain watermark, `pi2` takes
+    the child's race value, `max`, `tsum`, `min`, `lin` and `expsum` mix both
+    while keeping the result a standard Gumbel. `lookahead_ppl_soft`:
+    `pi1` is plain `ppl_soft`, `pi2`, `tsum`, `max` and `gauss` combine the rank
+    of the drafted token's score with the rank the row below sends up, and
+    `optpath` races it on its own score plus the realized score of the path
+    below."""
     aggregator_lambda: float = Field(default=1.0, gt=0)
-    """Weight of the child's value in the `lin` lookahead aggregator."""
+    """Weight of the child's value in the `lin` (`lookahead_gumbel` and its
+    dual-key and Gaussian copula variants) and `gauss` (`lookahead_ppl_soft`)
+    lookahead aggregators."""
+    lookahead_reward_samples: int = Field(default=64, ge=2)
+    """Size of each of the two reference samples `lookahead_textgrain` draws of
+    a child's expected-reward message to calibrate its parent (each costs that
+    many extra coupling solves per drafted row). Exactness holds for every
+    size; larger samples quantize the message less."""
     epsilon: float = Field(default=0.0, ge=0)
     """Perplexity budget of the perplexity watermarks: how many nats the
     expected surprisal of a sampled token may exceed the entropy of the model's
@@ -118,7 +139,15 @@ class WatermarkConfig:
     @property
     def supports_speculative_decoding(self) -> bool:
         # textGrain verifies drafts against its watermarked distribution.
-        return self.algorithm in ("dual_key_gumbel", "lookahead_gumbel", "textgrain")
+        return self.algorithm in (
+            "dual_key_gumbel",
+            "lookahead_gumbel",
+            "lookahead_dual_key_gumbel",
+            "lookahead_gaussian_copula",
+            "lookahead_ppl_soft",
+            "lookahead_textgrain",
+            "textgrain",
+        )
 
     @model_validator(mode="after")
     def validate_watermark_settings(self) -> Self:
@@ -126,6 +155,27 @@ class WatermarkConfig:
             raise ValueError("philox keys must fit in 64 bits")
         if self.message >= 2**self.message_bits:
             raise ValueError("message must fit in message_bits bits")
+        if (
+            self.algorithm
+            in (
+                "lookahead_gumbel",
+                "lookahead_dual_key_gumbel",
+                "lookahead_gaussian_copula",
+            )
+            and self.aggregator not in LOOKAHEAD_GUMBEL_AGGREGATORS
+        ):
+            raise ValueError(
+                f"{self.algorithm} supports the aggregators "
+                f"{LOOKAHEAD_GUMBEL_AGGREGATORS}"
+            )
+        if (
+            self.algorithm == "lookahead_ppl_soft"
+            and self.aggregator not in LOOKAHEAD_PPL_AGGREGATORS
+        ):
+            raise ValueError(
+                "lookahead_ppl_soft supports the aggregators "
+                f"{LOOKAHEAD_PPL_AGGREGATORS}"
+            )
         if self.algorithm == "rotation_first":
             self.deduplicate_contexts = "none"
             return self
@@ -137,15 +187,20 @@ class WatermarkConfig:
             "gumbel",
             "dual_key_gumbel",
             "lookahead_gumbel",
+            "lookahead_dual_key_gumbel",
             "ppl_hard",
             "ppl_soft",
+            "lookahead_ppl_soft",
             "gaussian_copula",
+            "lookahead_gaussian_copula",
         ) and (self.deduplicate_contexts == "none" or history_is_too_short):
             # These favor the same token whenever the key and context recur.
             name = {
                 "ppl_hard": "Hard perplexity",
                 "ppl_soft": "Soft perplexity",
+                "lookahead_ppl_soft": "Lookahead soft perplexity",
                 "gaussian_copula": "Gaussian copula",
+                "lookahead_gaussian_copula": "Lookahead Gaussian copula",
             }.get(self.algorithm, "Gumbel-max")
             logger.warning_once(
                 f"{name} watermarking with context deduplication "

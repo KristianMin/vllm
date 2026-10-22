@@ -12,6 +12,13 @@ the path up to the first rejected draft. Each aggregator maps two independent
 standard Gumbels to a standard Gumbel, so every row's race stays an exact
 Gumbel-max sample of its distribution as long as the drafts do not depend on
 the key. Detection is Gumbel-max detection.
+
+The rule needs only that every row races on standard Gumbels independent across
+its candidates and of the rows below, so it applies unchanged to the
+Gumbel-max watermarks that draw their Gumbels differently: TextSeal's dual-key
+Gumbel-max, whose rows race on key A's or, with probability ``alpha``, key B's
+Gumbels, and the Gaussian copula watermark, whose Gumbels mix the keyed uniform
+with fresh Gaussian noise.
 """
 
 import functools
@@ -20,14 +27,24 @@ import math
 import numpy as np
 import torch
 
-from vllm.config.watermarking import WatermarkPRFName
-from vllm.v1.watermarking.gumbel import GumbelWatermarker
-from vllm.v1.watermarking.prfs import PhiloxPRF, WatermarkPRF
+from vllm.config.watermarking import WatermarkPRFName, derive_watermark_key
+from vllm.v1.watermarking.gaussian_copula import (
+    DEFAULT_CORRELATION,
+    GaussianCopulaWatermarker,
+)
+from vllm.v1.watermarking.gaussian_copula import gumbels as copula_gumbels
+from vllm.v1.watermarking.gumbel import DualKeyGumbelWatermarker, GumbelWatermarker
+from vllm.v1.watermarking.prfs import PhiloxPRF, WatermarkPRF, create_prf
+from vllm.v1.watermarking.watermarker import RandomSampler, WatermarkSample
 
 AGGREGATORS = ("pi1", "pi2", "max", "tsum", "min", "lin", "expsum")
 TABULATED_AGGREGATORS = ("tsum", "min", "lin")
 _REARRANGED_GRID = 65537
 _REARRANGED_SAMPLES = 2_000_000
+# Seed the fresh randomness of verification, which receives no per-request
+# seeds. Public: the randomness needs no secrecy.
+_KEY_COIN_SEED = 0x4C4B41434F494E
+_COPULA_NOISE_SEED = 0x4C4B41434F50
 
 
 @functools.cache
@@ -69,6 +86,9 @@ class LookaheadGumbelWatermarker(GumbelWatermarker):
     # Verification picks every emitted token from the target's races, and the
     # rule is exact only for drafts that do not depend on the key.
     verifies_unwatermarked_drafts = True
+    # Whether the races' Gumbels are Philox Gumbels of ``prf``, which the CUDA
+    # kernels draw themselves; subclasses with other noise race in torch.
+    races_on_prf_gumbels = True
 
     def __init__(
         self,
@@ -153,7 +173,11 @@ class LookaheadGumbelWatermarker(GumbelWatermarker):
         skip_mask: torch.Tensor,
     ) -> torch.Tensor:
         children = self.children(draft_tokens, cu_num_logits)
-        if type(self.prf) is PhiloxPRF and logits.device.type == "cuda":
+        if (
+            self.races_on_prf_gumbels
+            and type(self.prf) is PhiloxPRF
+            and logits.device.type == "cuda"
+        ):
             from vllm.v1.worker.gpu.sample.lookahead_watermark import (
                 philox_lookahead_tokens,
                 point_mass_logits,
@@ -189,13 +213,17 @@ class LookaheadGumbelWatermarker(GumbelWatermarker):
         cu_num_logits: torch.Tensor,
         skip_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Torch reference of ``philox_lookahead_tokens``."""
+        """Torch reference of ``philox_lookahead_tokens``, racing on
+        ``race_gumbels``. Like the chain kernel it walks every request's rows
+        from the bonus row up, all requests at once."""
         logits = logits.float()
         logits = logits.masked_fill(logits.isnan(), float("-inf"))
-        vocab_size = logits.shape[-1]
-        vocabulary = torch.arange(vocab_size, device=logits.device)
-        uniforms = self.prf.uniform(contexts, vocabulary)
-        gumbels = -torch.log(-torch.log(uniforms))
+        num_rows, vocab_size = logits.shape
+        device = logits.device
+        if num_rows == 0:
+            return torch.zeros(0, dtype=torch.int64, device=device)
+        gumbels = self.race_gumbels(contexts, vocab_size)
+        vocabulary = torch.arange(vocab_size, device=device)
         is_child = vocabulary == children.unsqueeze(-1)
         others, other_tokens = (
             (logits + gumbels).masked_fill(is_child, float("-inf")).max(dim=-1)
@@ -205,27 +233,209 @@ class LookaheadGumbelWatermarker(GumbelWatermarker):
         child_gumbels = gumbels.gather(-1, safe).squeeze(-1)
         child_logits = logits.gather(-1, safe).squeeze(-1)
 
+        # Row ``ends[r] - 1 - step`` of request r, or none past its first row.
+        bounds = cu_num_logits.long()
+        ends = bounds[1:]
+        sizes = ends - bounds[:-1]
+        steps = torch.arange(int(sizes.max()), device=device)
+        exists = steps.unsqueeze(0) < sizes.unsqueeze(1)
+        rows = torch.where(exists, ends.unsqueeze(1) - 1 - steps.unsqueeze(0), 0)
+        in_support = (
+            (children >= 0) & (children < vocab_size) & (child_logits > float("-inf"))
+        )
+
         chosen = other_tokens.clone()
-        bounds = cu_num_logits.tolist()
-        for start, end in zip(bounds, bounds[1:]):
-            value = torch.zeros((), device=logits.device)
-            has_value = False
-            for row in range(end - 1, start - 1, -1):
-                active = not bool(skip_mask[row])
-                child = int(children[row])
-                in_support = (
-                    row < end - 1
-                    and 0 <= child < vocab_size
-                    and bool(child_logits[row] > float("-inf"))
-                )
-                own = child_gumbels[row]
-                if active and has_value and in_support:
-                    own = self.aggregate(own, value)
-                child_race = own + child_logits[row]
-                take_child = in_support and bool(child_race > others[row])
-                if take_child:
-                    chosen[row] = child
-                if active:
-                    value = (child_race if take_child else others[row]) - lse[row]
-                has_value = active
+        value = torch.zeros(sizes.numel(), device=device)
+        has_value = torch.zeros(sizes.numel(), dtype=torch.bool, device=device)
+        for step in range(steps.numel()):
+            row = rows[:, step]
+            # The bonus row (step 0) explores no child.
+            explores = exists[:, step] & in_support[row] & (step > 0)
+            active = exists[:, step] & ~skip_mask[row]
+            own = child_gumbels[row]
+            link = active & has_value & explores
+            own = torch.where(link, self.aggregate(own, value), own)
+            child_race = own + child_logits[row]
+            take_child = explores & (child_race > others[row])
+            chosen[row[take_child]] = children[row[take_child]].long()
+            race_value = torch.where(take_child, child_race, others[row]) - lse[row]
+            value = torch.where(active, race_value, value)
+            has_value = active
         return chosen
+
+    def race_gumbels(self, contexts: torch.Tensor, vocab_size: int) -> torch.Tensor:
+        """The standard Gumbels every row races its candidates on, independent
+        across rows and candidates: [num_rows, vocab_size] float32."""
+        vocabulary = torch.arange(vocab_size, device=contexts.device)
+        uniforms = self.prf.uniform(contexts, vocabulary)
+        return -torch.log(-torch.log(uniforms))
+
+
+def _fresh_generator(
+    generators: dict[torch.device, torch.Generator], device: torch.device, seed: int
+) -> torch.Generator:
+    generator = generators.get(device)
+    if generator is None:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(seed)
+        generators[device] = generator
+    return generator
+
+
+class LookaheadDualKeyGumbelWatermarker(LookaheadGumbelWatermarker):
+    """TextSeal's dual-key Gumbel-max (``dual_key_gumbel``) with lookahead
+    verification.
+
+    Without speculation it samples like ``dual_key_gumbel``: each token races on
+    key A's Gumbels, or with probability ``alpha`` on key B's. In speculative
+    verification every row flips that coin first and races on the chosen key's
+    Gumbels, and the path is decided as in lookahead Gumbel-max. The coin is
+    independent of both keys, so every row stays an exact sample and every
+    emitted token, accepted draft or not, carries key B with probability
+    ``alpha``. Detection is ``DualKeyGumbelWatermarkDetector``.
+
+    Verification receives no per-request seeds, so its coins come from a
+    generator the watermarker owns.
+    """
+
+    races_on_prf_gumbels = False
+
+    def __init__(
+        self,
+        key: int,
+        context_width: int = 4,
+        prf: WatermarkPRFName = "philox",
+        alpha: float = 0.1,
+        aggregator: str = "tsum",
+        aggregator_lambda: float = 1.0,
+    ) -> None:
+        # Not exposed as draft and target watermarkers: drafts stay unwatermarked.
+        self.sampling_watermarker = DualKeyGumbelWatermarker(
+            key, context_width, prf, alpha
+        )
+        super().__init__(
+            derive_watermark_key(key, b"key_a"),
+            context_width,
+            prf,
+            aggregator,
+            aggregator_lambda,
+        )
+        self.key_b_prf = create_prf(prf, derive_watermark_key(key, b"key_b"))
+        self.alpha = alpha
+        self._generators: dict[torch.device, torch.Generator] = {}
+
+    def sample(
+        self,
+        logits: torch.Tensor,
+        contexts: torch.Tensor,
+        random_sampler: RandomSampler | None = None,
+        skip_mask: torch.Tensor | None = None,
+    ) -> WatermarkSample:
+        return self.sampling_watermarker.sample(
+            logits, contexts, random_sampler, skip_mask
+        )
+
+    def _sample_watermarked(
+        self,
+        logits: torch.Tensor,
+        contexts: torch.Tensor,
+    ) -> WatermarkSample:
+        return self.sampling_watermarker._sample_watermarked(logits, contexts)
+
+    def race_gumbels(self, contexts: torch.Tensor, vocab_size: int) -> torch.Tensor:
+        if self.alpha == 0:
+            return super().race_gumbels(contexts, vocab_size)
+        vocabulary = torch.arange(vocab_size, device=contexts.device)
+        key_b = -torch.log(-torch.log(self.key_b_prf.uniform(contexts, vocabulary)))
+        if self.alpha == 1:
+            return key_b
+        generator = _fresh_generator(self._generators, contexts.device, _KEY_COIN_SEED)
+        use_key_b = (
+            torch.rand(contexts.shape[0], device=contexts.device, generator=generator)
+            < self.alpha
+        )
+        return torch.where(
+            use_key_b.unsqueeze(-1), key_b, super().race_gumbels(contexts, vocab_size)
+        )
+
+
+class LookaheadGaussianCopulaWatermarker(LookaheadGumbelWatermarker):
+    """The Gaussian copula watermark (``gaussian_copula``) with lookahead
+    verification.
+
+    Without speculation it samples like ``gaussian_copula``. In speculative
+    verification every row races on the copula's Gumbels
+    ``-log(-log Phi(z_u))`` with ``z_u = correlation * ndtri(U_u) + sqrt(1 -
+    correlation**2) * N_u``, standard Gumbels independent across candidates
+    and rows, and the path is decided as in lookahead Gumbel-max, so every row
+    stays an exact sample. Rows whose context reaches before the output are
+    verified without the watermark, as ``gaussian_copula`` samples them.
+    Detection is ``GaussianCopulaWatermarkDetector``.
+
+    Verification receives no per-request seeds, so its fresh noise ``N`` comes
+    from a generator the watermarker owns.
+    """
+
+    races_on_prf_gumbels = False
+
+    def __init__(
+        self,
+        key: int,
+        context_width: int = 4,
+        prf: WatermarkPRF | WatermarkPRFName = "philox",
+        correlation: float = DEFAULT_CORRELATION,
+        aggregator: str = "tsum",
+        aggregator_lambda: float = 1.0,
+    ) -> None:
+        self.sampling_watermarker = GaussianCopulaWatermarker(
+            key, context_width, prf, correlation
+        )
+        super().__init__(
+            key,
+            context_width,
+            self.sampling_watermarker.prf,
+            aggregator,
+            aggregator_lambda,
+        )
+        self.correlation = correlation
+        self._generators: dict[torch.device, torch.Generator] = {}
+
+    def sample(
+        self,
+        logits: torch.Tensor,
+        contexts: torch.Tensor,
+        random_sampler: RandomSampler | None = None,
+        skip_mask: torch.Tensor | None = None,
+    ) -> WatermarkSample:
+        return self.sampling_watermarker.sample(
+            logits, contexts, random_sampler, skip_mask
+        )
+
+    def _sample_watermarked(
+        self,
+        logits: torch.Tensor,
+        contexts: torch.Tensor,
+    ) -> WatermarkSample:
+        return self.sampling_watermarker._sample_watermarked(logits, contexts)
+
+    def verification_logits(
+        self,
+        logits: torch.Tensor,
+        contexts: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+        skip_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        partial = (contexts < 0).any(dim=-1)
+        return super().verification_logits(
+            logits, contexts, draft_tokens, cu_num_logits, skip_mask | partial
+        )
+
+    def race_gumbels(self, contexts: torch.Tensor, vocab_size: int) -> torch.Tensor:
+        vocabulary = torch.arange(vocab_size, device=contexts.device)
+        uniforms = self.prf.uniform(contexts, vocabulary)
+        generator = _fresh_generator(
+            self._generators, contexts.device, _COPULA_NOISE_SEED
+        )
+        noise = torch.randn(uniforms.shape, device=uniforms.device, generator=generator)
+        return copula_gumbels(uniforms, noise, self.correlation)
