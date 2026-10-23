@@ -1350,7 +1350,13 @@ class VllmConfig:
                 raise ValueError(
                     "Parallel speculative drafting is not supported with watermarking."
                 )
-            if speculative_config.method not in ("dspark", "eagle", "eagle3", "mtp"):
+            if speculative_config.method not in (
+                "dspark",
+                "draft_model",
+                "eagle",
+                "eagle3",
+                "mtp",
+            ):
                 raise ValueError(
                     "Watermarking supports only autoregressive model-based "
                     "speculative decoding."

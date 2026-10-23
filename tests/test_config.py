@@ -3914,6 +3914,19 @@ def test_dual_key_gumbel_supports_dspark():
     config._check_supports_watermarking()
 
 
+def test_dual_key_gumbel_accepts_draft_model_speculation():
+    config = _watermarked_vllm_config()
+    config.watermark_config = WatermarkConfig(algorithm="dual_key_gumbel", key=42)
+    config.speculative_config = SimpleNamespace(
+        method="draft_model",
+        draft_sample_method="probabilistic",
+        rejection_sample_method="standard",
+        parallel_drafting=False,
+    )
+
+    config._check_supports_watermarking()
+
+
 def test_dual_key_gumbel_rejects_non_autoregressive_speculation():
     config = _watermarked_vllm_config()
     config.watermark_config = WatermarkConfig(algorithm="dual_key_gumbel", key=42)
