@@ -37,6 +37,9 @@ LookaheadAggregator = Literal[
 ]
 # The aggregators each lookahead algorithm implements.
 LOOKAHEAD_GUMBEL_AGGREGATORS = ("pi1", "pi2", "max", "tsum", "min", "lin", "expsum")
+# Aggregators that carry the realized score of the path below up the rows,
+# lookahead_gumbel only (its score is the Gumbel-max detection score).
+LOOKAHEAD_GUMBEL_PATH_AGGREGATORS = ("optpath",)
 LOOKAHEAD_PPL_AGGREGATORS = ("pi1", "pi2", "tsum", "max", "gauss", "optpath")
 WatermarkPRFName = Literal["philox"]
 WatermarkContextScope = Literal["none", "single_turn", "all"]
@@ -176,10 +179,19 @@ class WatermarkConfig:
                 "lookahead_gaussian_copula",
             )
             and self.aggregator not in LOOKAHEAD_GUMBEL_AGGREGATORS
+            and not (
+                self.algorithm == "lookahead_gumbel"
+                and self.aggregator in LOOKAHEAD_GUMBEL_PATH_AGGREGATORS
+            )
         ):
             raise ValueError(
                 f"{self.algorithm} supports the aggregators "
                 f"{LOOKAHEAD_GUMBEL_AGGREGATORS}"
+                + (
+                    f" and {LOOKAHEAD_GUMBEL_PATH_AGGREGATORS}"
+                    if self.algorithm == "lookahead_gumbel"
+                    else ""
+                )
             )
         if (
             self.algorithm == "lookahead_ppl_soft"
