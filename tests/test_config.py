@@ -3805,6 +3805,43 @@ def test_dual_key_gumbel_alpha_warning_is_not_emitted(
     assert "is not used" not in caplog_vllm.text
 
 
+@pytest.mark.parametrize(
+    "algorithm",
+    ["lookahead_gumbel", "lookahead_dual_key_gumbel", "lookahead_gaussian_copula"],
+)
+def test_lookahead_accepts_greedy_drafting(algorithm):
+    config = _watermarked_vllm_config()
+    config.watermark_config = WatermarkConfig(algorithm=algorithm, key=42)
+    config.speculative_config = SimpleNamespace(
+        method="mtp",
+        draft_sample_method="greedy",
+        rejection_sample_method="standard",
+        parallel_drafting=False,
+    )
+
+    config._check_supports_watermarking()
+
+
+def test_verifies_unwatermarked_drafts_matches_the_watermarkers():
+    from vllm.v1.watermarking import create_watermarker
+
+    for algorithm in (
+        "gumbel",
+        "dual_key_gumbel",
+        "synthid",
+        "gaussian_copula",
+        "lookahead_gumbel",
+        "lookahead_dual_key_gumbel",
+        "lookahead_gaussian_copula",
+        "textgrain",
+    ):
+        config = WatermarkConfig(algorithm=algorithm, key=42)
+        watermarker = create_watermarker(config)
+        assert config.verifies_unwatermarked_drafts == getattr(
+            watermarker, "verifies_unwatermarked_drafts", False
+        ), algorithm
+
+
 def test_dual_key_gumbel_requires_probabilistic_drafting():
     config = _watermarked_vllm_config()
     config.watermark_config = WatermarkConfig(algorithm="dual_key_gumbel", key=42)

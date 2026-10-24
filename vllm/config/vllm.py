@@ -1333,10 +1333,18 @@ class VllmConfig:
             return False
         if self.speculative_config is not None:
             speculative_config = self.speculative_config
-            if speculative_config.draft_sample_method != "probabilistic":
+            # Algorithms that verify unwatermarked drafts also take greedy
+            # drafts: a lookahead row accepts a draft only if it is the row's
+            # race winner, so its acceptance is p(draft) either way, which a
+            # greedy draft maximizes.
+            if speculative_config.draft_sample_method != "probabilistic" and not (
+                speculative_config.draft_sample_method == "greedy"
+                and watermark_config.verifies_unwatermarked_drafts
+            ):
                 raise ValueError(
                     "Speculative decoding with watermarking requires "
-                    "draft_sample_method='probabilistic'."
+                    "draft_sample_method='probabilistic' ('greedy' is also "
+                    "allowed for algorithms that verify unwatermarked drafts)."
                 )
             if speculative_config.rejection_sample_method != "standard":
                 raise ValueError(

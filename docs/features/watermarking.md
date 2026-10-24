@@ -102,6 +102,14 @@ standard rejection sampling, and an autoregressive model-based method (`dspark`,
 by `dspark`. With `draft_model`, a smaller model that shares the target's
 tokenizer drafts, and its tokens are watermarked like those of the other methods.
 
+Algorithms that verify unwatermarked drafts (the lookahead watermarks and
+textGrain) also accept `"draft_sample_method": "greedy"`. A lookahead row
+accepts a draft only when the draft is the row's race winner, so a draft is
+accepted with the target's probability of it. With probabilistic drafts the
+acceptance rate is Σ p·q, below the Σ min(p, q) of unwatermarked speculative
+decoding; a greedy draft is accepted with the target's probability of the
+drafter's top token, as in unwatermarked greedy drafting.
+
 A watermarking algorithm without native speculative-decoding support is
 rejected before model loading. Set
 `"allow_target_only_watermarking": true` to allow it: accepted draft tokens are

@@ -149,6 +149,19 @@ class WatermarkConfig:
             "textgrain",
         )
 
+    @property
+    def verifies_unwatermarked_drafts(self) -> bool:
+        # Drafts are sampled without the key and verified against the
+        # watermark, so the output stays exact however they are sampled.
+        return self.algorithm in (
+            "lookahead_gumbel",
+            "lookahead_dual_key_gumbel",
+            "lookahead_gaussian_copula",
+            "lookahead_ppl_soft",
+            "lookahead_textgrain",
+            "textgrain",
+        )
+
     @model_validator(mode="after")
     def validate_watermark_settings(self) -> Self:
         if self.key > 2**64 - 1:
