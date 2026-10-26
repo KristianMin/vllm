@@ -429,7 +429,10 @@ vllm serve MODEL \
 ```
 
 `context_width` and context deduplication are ignored. Classes are built from
-the tokenizer at startup, so `skip_tokenizer_init` is rejected. Per-request
+the tokenizer at startup, so `skip_tokenizer_init` is rejected. Words are Latin
+letters (`a-z`) by default; `"lexical_letters":"latin_cyrillic"` also groups
+words of lowercase Cyrillic letters (`а-я`, `ѐ-џ`), for Cyrillic-script output.
+The detector takes the same `lexical_letters`. Per-request
 state takes `4 * num_eligible_classes + vocab_size / 8` bytes per
 `max_num_seqs` slot (about 184 KB for Llama 3). Speculative decoding is not
 supported.
@@ -565,6 +568,26 @@ independent PRF uniforms as in the other schemes. No ×20 correction is applied:
 from vllm.v1.watermarking import GaussianCopulaWatermarkDetector
 
 result = GaussianCopulaWatermarkDetector(key=42, context_width=2).detect(token_ids)
+```
+
+Two weighted tests sum `w * -log(1 - U)` with weights `w` from 1 to 3.5 in
+steps of 0.25, and report the tail of that sum for independent Exp(1) scores by
+a saddlepoint (Lugannani-Rice) approximation. AutoMark's surprisal weighting
+takes a detection model's log-probability of each token, for example from a
+forward pass over the text alone, and weighs a score by
+`1 + min(-logprob, 2.5)`. The text-only weighting gives `word_start_weight` to
+tokens that start a word (a leading space, or after a token without letters or
+digits) or follow a sentence end (a token ending in `.!?:;`), and 1 to tokens
+after a newline and inside words:
+
+```python
+detector = GaussianCopulaWatermarkDetector(key=42, context_width=2)
+result = detector.detect(token_ids, logprobs=token_logprobs)
+
+detector = GaussianCopulaWatermarkDetector(
+    key=42, context_width=2, tokenizer=tokenizer, word_start_weight=3.0
+)
+result = detector.detect(token_ids)
 ```
 
 The Gaussian copula watermark does not support

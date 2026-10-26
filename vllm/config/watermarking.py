@@ -42,6 +42,7 @@ LOOKAHEAD_GUMBEL_AGGREGATORS = ("pi1", "pi2", "max", "tsum", "min", "lin", "exps
 LOOKAHEAD_GUMBEL_PATH_AGGREGATORS = ("optpath",)
 LOOKAHEAD_PPL_AGGREGATORS = ("pi1", "pi2", "tsum", "max", "gauss", "optpath")
 WatermarkPRFName = Literal["philox"]
+RotationFirstLexicalLetters = Literal["latin", "latin_cyrillic"]
 WatermarkContextScope = Literal["none", "single_turn", "all"]
 
 _MIN_RECOMMENDED_DEDUP_HISTORY = 1024
@@ -136,6 +137,10 @@ class WatermarkConfig:
     many positions."""
     prf: WatermarkPRFName = "philox"
     """Pseudorandom function used by the watermarking algorithm."""
+    lexical_letters: RotationFirstLexicalLetters = "latin"
+    """Letters of the words `rotation_first` groups into lexical classes:
+    `latin` (a-z) or `latin_cyrillic` (also the lowercase Cyrillic letters
+    а-я and ѐ-џ). Detection must use the same setting."""
     allow_target_only_watermarking: bool = False
     """Allow speculative decoding without watermarking draft tokens."""
 

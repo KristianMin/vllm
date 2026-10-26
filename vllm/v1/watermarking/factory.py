@@ -175,6 +175,7 @@ def create_watermarker(
             max_num_reqs,
             device,
             config.prf,
+            config.lexical_letters,
         )
     if config.algorithm == "concordmark":
         return ConcordMarkWatermarker(

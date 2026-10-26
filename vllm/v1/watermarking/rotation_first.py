@@ -10,7 +10,11 @@ from typing import Any
 import regex as re
 import torch
 
-from vllm.config.watermarking import WatermarkPRFName, derive_watermark_key
+from vllm.config.watermarking import (
+    RotationFirstLexicalLetters,
+    WatermarkPRFName,
+    derive_watermark_key,
+)
 from vllm.v1.watermarking.detector import WatermarkDetector
 from vllm.v1.watermarking.gumbel import _gamma_survival_integer_shape
 from vllm.v1.watermarking.prfs import PhiloxPRF, WatermarkPRF, create_prf
@@ -29,27 +33,37 @@ _UNIFORM_ERROR = 2.0**-23
 _PIVOT_ERROR = (4 / math.pi) * (
     math.sqrt(2 * _UNIFORM_ERROR) + 2 * math.pi * _UNIFORM_ERROR
 )
-_LEXICAL_KEY = re.compile("[a-z]{3,}")
+# Words a lexical class may be: three or more letters of these alphabets. U+0430
+# to U+045F are the lowercase Cyrillic letters, а-я and ѐ-џ.
+_LEXICAL_KEYS = {
+    "latin": re.compile("[a-z]{3,}"),
+    "latin_cyrillic": re.compile("[a-zа-џ]{3,}"),
+}
 _UINT32_MASK = 2**32 - 1
 
 
 def lexical_token_classes(
-    tokenizer: Any, vocab_size: int | None = None
+    tokenizer: Any,
+    vocab_size: int | None = None,
+    lexical_letters: RotationFirstLexicalLetters = "latin",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Group the tokens that decode to the same lowercase word.
 
-    A token is eligible when its stripped, lowercased decoded text matches
-    ``[a-z]{3,}``; its class is the smallest token ID with the same text.
-    Other tokens, including those beyond the tokenizer, are singletons.
+    A token is eligible when its stripped, lowercased decoded text is three or
+    more letters of ``lexical_letters``: ``[a-z]`` for ``latin``, also
+    ``[а-џ]`` for ``latin_cyrillic``. Its class is the smallest token ID with
+    the same text. Other tokens, including those beyond the tokenizer, are
+    singletons.
     """
     if vocab_size is None:
         vocab_size = len(tokenizer)
+    lexical_key = _LEXICAL_KEYS[lexical_letters]
     classes = list(range(vocab_size))
     eligible = [False] * vocab_size
     first_ids: dict[str, int] = {}
     for token_id in range(min(len(tokenizer), vocab_size)):
         text = tokenizer.decode([token_id]).strip().lower()
-        if _LEXICAL_KEY.fullmatch(text):
+        if lexical_key.fullmatch(text):
             classes[token_id] = first_ids.setdefault(text, token_id)
             eligible[token_id] = True
     return torch.tensor(classes), torch.tensor(eligible)
@@ -137,11 +151,14 @@ class RotationFirstWatermarker(Watermarker):
         max_num_reqs: int,
         device: torch.device,
         prf: WatermarkPRF | WatermarkPRFName = "philox",
+        lexical_letters: RotationFirstLexicalLetters = "latin",
     ) -> None:
         self.prf = create_prf(prf, key) if isinstance(prf, str) else prf
         private_key = derive_watermark_key(key, b"rotation_first_private")
         self.private_prf = PhiloxPRF(private_key)
-        token_classes, eligible = lexical_token_classes(tokenizer, vocab_size)
+        token_classes, eligible = lexical_token_classes(
+            tokenizer, vocab_size, lexical_letters
+        )
         self.token_classes = token_classes.to(device)
         eligible_classes = eligible & (token_classes == torch.arange(vocab_size))
         num_eligible = int(eligible_classes.sum())
@@ -305,10 +322,13 @@ class RotationFirstWatermarkDetector(WatermarkDetector):
         tokenizer: Any,
         p_value_threshold: float = 0.01,
         prf: WatermarkPRF | WatermarkPRFName = "philox",
+        lexical_letters: RotationFirstLexicalLetters = "latin",
     ) -> None:
         super().__init__(1, p_value_threshold)
         self.prf = create_prf(prf, key) if isinstance(prf, str) else prf
-        token_classes, eligible = lexical_token_classes(tokenizer)
+        token_classes, eligible = lexical_token_classes(
+            tokenizer, lexical_letters=lexical_letters
+        )
         self.token_classes = token_classes.cpu().tolist()
         self.eligible = eligible.cpu().tolist()
 

@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import numpy
 import pytest
 import torch
-from scipy import stats
+from scipy import integrate, stats
 
 from vllm.platforms import current_platform
 from vllm.v1.watermarking import (
@@ -233,3 +234,130 @@ def test_capped_kernel_keeps_plain_tail_and_keys_only_head_tokens(use_fp64):
 
     expected = torch.where(in_head & ~skip.cpu(), winners, plain)
     assert torch.equal(sample.token_ids.cpu(), expected)
+
+
+def test_surprisal_weighting_without_surprisal_is_the_plain_test():
+    detector = GaussianCopulaWatermarkDetector(key=42, context_width=2)
+    token_ids = [3, 5, 3, 5, 3, 7] + list(range(40))
+
+    plain = detector.detect(token_ids)
+    weighted = detector.detect(token_ids, logprobs=[0.0] * len(token_ids))
+
+    assert weighted.num_scored_tokens == plain.num_scored_tokens
+    assert weighted.score == pytest.approx(plain.score, rel=1e-12)
+    # The plain test sums the integer-shape Gamma series, this one gammaincc.
+    assert weighted.p_value == pytest.approx(plain.p_value, rel=1e-7)
+
+
+def test_surprisal_weights_follow_automarks_levels():
+    detector = GaussianCopulaWatermarkDetector(key=42, context_width=1)
+    token_ids = [1, 2, 3, 4, 5]
+    # Levels round(4 * min(surprisal, 2.5)): None and positive log-probs weigh 1.
+    logprobs = [-9.0, -0.3, None, -7.0, 0.5]
+
+    weighted = detector.detect(token_ids, logprobs)
+    contexts, targets = detector._prepare_inputs(token_ids)
+    scores = detector._score_tokens(contexts, targets)
+
+    weights = torch.tensor([1.25, 1.0, 3.5, 1.0], dtype=torch.float64)
+    assert weighted.score == pytest.approx((weights * scores).sum().item())
+
+
+def test_surprisal_weighted_p_values_are_uniform_without_watermark():
+    detector = GaussianCopulaWatermarkDetector(key=42, context_width=2)
+    generator = torch.Generator().manual_seed(0)
+    p_values = []
+    for _ in range(400):
+        token_ids = torch.randint(0, 50_000, (120,), generator=generator).tolist()
+        logprobs = (-4 * torch.rand(120, generator=generator)).tolist()
+        p_values.append(detector.detect(token_ids, logprobs).p_value)
+
+    assert stats.kstest(p_values, "uniform").pvalue > 1e-3
+
+
+def test_surprisal_weighting_detects_generated_text():
+    watermarker = GaussianCopulaWatermarker(key=42, context_width=2)
+    watermarked = _generate(watermarker, seed=1)
+    unwatermarked = _generate(watermarker, seed=2, watermarked=False)
+    detector = GaussianCopulaWatermarkDetector(key=42, context_width=2)
+
+    assert detector.detect(watermarked, [-1.0] * len(watermarked)).p_value < 1e-6
+    assert not detector.detect(
+        unwatermarked, [-1.0] * len(unwatermarked)
+    ).is_watermarked
+
+
+def test_logprobs_need_one_value_per_token():
+    detector = GaussianCopulaWatermarkDetector(key=42, context_width=2)
+
+    with pytest.raises(ValueError, match="one value per token"):
+        detector.detect([1, 2, 3], [-1.0, -1.0])
+
+
+class _PieceTokenizer:
+    def __init__(self, pieces: list[str]) -> None:
+        self.pieces = pieces
+
+    def __len__(self) -> int:
+        return len(self.pieces)
+
+    def convert_ids_to_tokens(self, token_ids: list[int]) -> list[str]:
+        return [self.pieces[token_id] for token_id in token_ids]
+
+
+# 0 "▁The", 1 "▁cat", 2 "s", 3 ".", 4 "\n", 5 "▁sat", 6 "(", 7 "on", 8 "<0x0A>"
+_SENTENCEPIECE = ["▁The", "▁cat", "s", ".", "\n", "▁sat", "(", "on", "<0x0A>"]
+# The same vocabulary as byte-level BPE pieces: "Ġ" is a space, "Ċ" a newline.
+_BYTE_LEVEL = ["ĠThe", "Ġcat", "s", ".", "Ċ", "Ġsat", "(", "on", "Ċ"]
+
+
+@pytest.mark.parametrize("pieces", [_SENTENCEPIECE, _BYTE_LEVEL])
+def test_word_start_weights_mark_word_and_sentence_starts(pieces):
+    detector = GaussianCopulaWatermarkDetector(
+        key=42,
+        context_width=1,
+        tokenizer=_PieceTokenizer(pieces),
+        word_start_weight=3.0,
+    )
+    token_ids = [0, 1, 2, 3, 0, 4, 5, 6, 7, 8, 1, 2]
+
+    levels = detector.word_starts.levels(token_ids, range(len(token_ids)))
+
+    # Weight 3 (level 8) for the word starts " cat" and "on" (after "(") and
+    # " The" after the sentence end; 1 for the first token, tokens inside a
+    # word or glued to it ("s", ".", "\n", "("), and tokens after a newline.
+    assert levels.tolist() == [0, 8, 0, 0, 8, 0, 0, 0, 8, 0, 0, 0]
+
+
+def test_word_start_weighting_matches_the_two_gamma_tail():
+    pieces = ["▁w" + str(i) if i % 3 == 0 else "x" + str(i) for i in range(300)]
+    detector = GaussianCopulaWatermarkDetector(
+        key=42,
+        context_width=2,
+        tokenizer=_PieceTokenizer(pieces),
+        word_start_weight=3.0,
+    )
+    token_ids = torch.randint(
+        0, 300, (200,), generator=torch.Generator().manual_seed(1)
+    ).tolist()
+
+    result = detector.detect(token_ids)
+
+    positions = detector._scored_positions(token_ids)
+    contexts, targets = detector._pairs(token_ids, positions)
+    scores = detector._score_tokens(contexts, targets).numpy()
+    heavy = detector.word_starts.levels(token_ids, positions).numpy() == 8
+    total = 3 * scores[heavy].sum() + scores[~heavy].sum()
+    # P(3 * Gamma(n_A) + Gamma(n_B) >= total), by numerical integration.
+    x = numpy.linspace(0, total / 3, 200_001)[1:]
+    density = stats.gamma.pdf(x, heavy.sum()) * stats.gamma.sf(
+        total - 3 * x, (~heavy).sum()
+    )
+    exact = stats.gamma.sf(total / 3, heavy.sum()) + integrate.trapezoid(density, x)
+    assert result.score == pytest.approx(total)
+    assert result.p_value == pytest.approx(exact, rel=1e-2)
+
+
+def test_word_start_weighting_needs_the_tokenizer():
+    with pytest.raises(ValueError, match="tokenizer"):
+        GaussianCopulaWatermarkDetector(key=42, word_start_weight=3.0)
