@@ -56,6 +56,19 @@ def test_non_diffusion_models_unaffected():
     params.verify(MockModelConfig(), None, None, None)
 
 
+def test_spec_decode_min_p_needs_model_runner_v2():
+    spec = SimpleNamespace(num_speculative_tokens=3)
+    params = SamplingParams(min_p=0.05)
+    with pytest.raises(VLLMValidationError, match="min_p .* Model Runner V1"):
+        params.verify(MockModelConfig(), spec, None, None)
+    params.verify(MockModelConfig(), spec, None, None, use_v2_model_runner=True)
+    params.verify(MockModelConfig(), None, None, None)
+
+    biased = SamplingParams(logit_bias={0: 1.0})
+    with pytest.raises(VLLMValidationError, match="logit_bias"):
+        biased.verify(MockModelConfig(), spec, None, None, use_v2_model_runner=True)
+
+
 def test_verify_leaves_logits_processors_to_admission():
     """verify() is runner-agnostic; LP validation lives in the admission
     layer, so an unimportable FQCN must not fail verify()."""
