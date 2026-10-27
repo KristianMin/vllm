@@ -321,3 +321,51 @@ def test_philox_mixed_draft_sampling_caches_unprocessed_logits():
     stored = cache[torch.arange(num_rows, device="cuda"), cols.long(), :vocab_size]
     assert torch.equal(stored.view(torch.int16), logits.view(torch.int16))
     assert not cache[:, :, -1].any()
+
+
+@pytest.mark.parametrize("deduplicate_contexts", [True, False])
+def test_weighted_detection_scores_the_plain_positions(deduplicate_contexts):
+    from vllm.v1.watermarking import WeightedGumbelWatermarkDetector
+
+    detector = WeightedGumbelWatermarkDetector(
+        key=42, context_width=2, deduplicate_contexts=deduplicate_contexts
+    )
+    token_ids = [3, 5, 3, 5, 3, 5, 7, 3, 5] + list(range(30))
+
+    plain_contexts, plain_targets = detector._prepare_inputs(token_ids)
+    contexts, targets = detector._pairs(
+        token_ids, detector._scored_positions(token_ids)
+    )
+
+    assert torch.equal(contexts, plain_contexts)
+    assert torch.equal(targets, plain_targets)
+
+
+def test_gumbel_surprisal_weighting_without_surprisal_is_the_plain_test():
+    from vllm.v1.watermarking import WeightedGumbelWatermarkDetector
+
+    detector = WeightedGumbelWatermarkDetector(key=42, context_width=2)
+    token_ids = [3, 5, 3, 5, 3, 7] + list(range(40))
+
+    plain = detector.detect(token_ids)
+    weighted = detector.detect(token_ids, logprobs=[0.0] * len(token_ids))
+
+    assert weighted.num_scored_tokens == plain.num_scored_tokens
+    assert weighted.score == pytest.approx(plain.score, rel=1e-12)
+    assert weighted.p_value == pytest.approx(plain.p_value, rel=1e-7)
+
+
+def test_gumbel_surprisal_weighted_p_values_are_uniform_without_watermark():
+    from scipy import stats
+
+    from vllm.v1.watermarking import WeightedGumbelWatermarkDetector
+
+    detector = WeightedGumbelWatermarkDetector(key=42, context_width=2)
+    generator = torch.Generator().manual_seed(0)
+    p_values = []
+    for _ in range(400):
+        token_ids = torch.randint(0, 50_000, (120,), generator=generator).tolist()
+        logprobs = (-4 * torch.rand(120, generator=generator)).tolist()
+        p_values.append(detector.detect(token_ids, logprobs).p_value)
+
+    assert stats.kstest(p_values, "uniform").pvalue > 1e-3

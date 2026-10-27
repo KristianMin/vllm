@@ -6,16 +6,13 @@
 https://arxiv.org/abs/2609.37310."""
 
 import math
-from collections.abc import Sequence
 from typing import Any
 
 import torch
 
 from vllm.config.watermarking import WatermarkPRFName
-from vllm.v1.watermarking.concordmark import _WEIGHT_LEVELS, _weighted_tail
-from vllm.v1.watermarking.detector import WatermarkDetection
 from vllm.v1.watermarking.gumbel import (
-    GumbelWatermarkDetector,
+    WeightedGumbelWatermarkDetector,
     _validate_context_width,
 )
 from vllm.v1.watermarking.prfs import PhiloxPRF, WatermarkPRF, create_prf
@@ -24,7 +21,6 @@ from vllm.v1.watermarking.watermarker import (
     Watermarker,
     WatermarkSample,
 )
-from vllm.v1.watermarking.weighting import WordStartWeights, surprisal_levels
 
 # AutoMark's coupling for its copula, chosen to match the quality of TextSeal
 # at alpha 0.1.
@@ -162,19 +158,15 @@ class GaussianCopulaWatermarker(Watermarker):
         return WatermarkSample(token_ids, logits)
 
 
-class GaussianCopulaWatermarkDetector(GumbelWatermarkDetector):
+class GaussianCopulaWatermarkDetector(WeightedGumbelWatermarkDetector):
     """Detect a Gaussian copula watermark.
 
     Every distinct (context, token) pair with a full context scores
     ``-log(1 - U)``, which is Exp(1) without the watermark; the p-value is the
     Gamma tail of the summed score, assuming ideal independent PRF uniforms.
 
-    Two weighted tests sum ``w * -log(1 - U)`` instead, with weights from 1 to
-    3.5 in steps of 0.25, and report the tail of that sum for independent
-    Exp(1) scores (saddlepoint approximation): AutoMark's surprisal weights,
-    given a detection model's log-probabilities (``detect(token_ids,
-    logprobs)``), or text-only weights, ``word_start_weight`` for tokens that
-    start a word or follow a sentence end (``tokenizer`` required).
+    The weighted tests of ``WeightedGumbelWatermarkDetector`` apply, over
+    these positions.
     """
 
     def __init__(
@@ -187,52 +179,18 @@ class GaussianCopulaWatermarkDetector(GumbelWatermarkDetector):
         word_start_weight: float = 1.0,
     ) -> None:
         super().__init__(
-            key, context_width, p_value_threshold, prf, deduplicate_contexts=False
-        )
-        self.word_starts = None
-        if word_start_weight != 1.0:
-            if tokenizer is None:
-                raise ValueError("word_start_weight needs the tokenizer")
-            self.word_starts = WordStartWeights(tokenizer, word_start_weight)
-
-    def detect(
-        self,
-        token_ids: list[int],
-        logprobs: Sequence[float | None] | None = None,
-    ) -> WatermarkDetection:
-        """Test generated ``token_ids``, excluding the prompt. With
-        ``logprobs``, ``logprobs[i]`` is a detection model's log-probability
-        of ``token_ids[i]`` (or None), and each score weighs ``1 + min(-logprob,
-        2.5)``, rounded to steps of 0.25."""
-        if logprobs is None and self.word_starts is None:
-            return super().detect(token_ids)
-        if logprobs is not None and self.word_starts is not None:
-            raise ValueError("logprobs and word_start_weight are exclusive")
-        if logprobs is not None and len(logprobs) != len(token_ids):
-            raise ValueError(
-                f"logprobs must hold one value per token, got {len(logprobs)} "
-                f"for {len(token_ids)} tokens"
-            )
-        positions = self._scored_positions(token_ids)
-        if not positions:
-            return WatermarkDetection(0.0, 1.0, 0, False)
-        contexts, targets = self._pairs(token_ids, positions)
-        if logprobs is not None:
-            levels = surprisal_levels([logprobs[p] for p in positions])
-        else:
-            assert self.word_starts is not None
-            levels = self.word_starts.levels(token_ids, positions)
-        scores = self._score_tokens(contexts, targets)
-        score = (_WEIGHT_LEVELS[levels] * scores).sum().item()
-        hist = torch.bincount(levels, minlength=len(_WEIGHT_LEVELS))
-        p_value = _weighted_tail(score, hist)
-        return WatermarkDetection(
-            score, p_value, len(positions), p_value <= self.p_value_threshold
+            key,
+            context_width,
+            p_value_threshold,
+            prf,
+            deduplicate_contexts=False,
+            tokenizer=tokenizer,
+            word_start_weight=word_start_weight,
         )
 
     def _scored_positions(self, token_ids: list[int]) -> list[int]:
         """Positions of the first occurrence of each (context, token) pair
-        with a full context."""
+        with a full context (the Gumbel detector's rule is per context)."""
         width = self.context_width
         first: dict[tuple[tuple[int, ...], int], int] = {}
         for stop in range(width, len(token_ids)):
