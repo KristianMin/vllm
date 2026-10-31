@@ -786,3 +786,27 @@ def test_draft_watermarker_writes_the_draft_logits_and_races_on_the_shared_noise
     )
     expected = torch.argmax((logits / 0.7).double() - torch.log(clocks), dim=-1)
     assert torch.equal(drafts, expected)
+
+
+def test_lookahead_textseal2_verifies_unwatermarked_drafts():
+    """Lookahead TextSeal2 is lookahead Gumbel-max on TextSeal2's race: it
+    drafts without the key and accepts only the race winner, so greedy drafts
+    are allowed as for the other lookahead watermarks."""
+    import torch
+
+    from vllm.config.watermarking import WatermarkConfig
+    from vllm.v1.watermarking.factory import create_watermarker
+    from vllm.v1.watermarking.spec_decode import create_speculative_draft_watermarker
+
+    config = WatermarkConfig(key=1, algorithm="lookahead_textseal2")
+    assert config.verifies_unwatermarked_drafts
+    watermarker = create_watermarker(config)
+    # No keyed draft watermarker: the drafts stay unwatermarked and are verified.
+    assert (
+        create_speculative_draft_watermarker(
+            watermarker, 4, torch.device("cpu"), allow_target_only=False
+        )
+        is None
+    )
+    textseal2 = WatermarkConfig(key=1, algorithm="textseal2")
+    assert not textseal2.verifies_unwatermarked_drafts

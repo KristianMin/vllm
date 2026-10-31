@@ -196,6 +196,7 @@ class WatermarkConfig:
             "lookahead_gumbel",
             "lookahead_dual_key_gumbel",
             "lookahead_gaussian_copula",
+            "lookahead_textseal2",
             "lookahead_ppl_soft",
             "lookahead_textgrain",
             "textgrain",
