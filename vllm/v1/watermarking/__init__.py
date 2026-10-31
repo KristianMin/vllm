@@ -19,6 +19,7 @@ from vllm.v1.watermarking.gumbel import (
     DualKeyGumbelWatermarker,
     GumbelWatermarkDetector,
     GumbelWatermarker,
+    WeightedGumbelWatermarkDetector,
 )
 from vllm.v1.watermarking.localized import LocalizedWatermarkDetection
 from vllm.v1.watermarking.lookahead import (
@@ -82,6 +83,7 @@ __all__ = [
     "GaussianCopulaWatermarkDetector",
     "GaussianCopulaWatermarker",
     "GumbelWatermarkDetector",
+    "WeightedGumbelWatermarkDetector",
     "GumbelWatermarker",
     "MultibitRedGreenWatermarkDetector",
     "MultibitRedGreenWatermarker",

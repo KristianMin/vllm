@@ -590,6 +590,9 @@ detector = GaussianCopulaWatermarkDetector(
 result = detector.detect(token_ids)
 ```
 
+The same weighted tests detect Gumbel-max watermarks (`gumbel`, `lookahead_gumbel`) with
+`WeightedGumbelWatermarkDetector`, over the positions `GumbelWatermarkDetector` scores.
+
 The Gaussian copula watermark does not support
 [speculative decoding](#speculative-decoding).
 

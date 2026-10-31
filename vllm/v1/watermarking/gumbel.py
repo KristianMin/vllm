@@ -6,6 +6,7 @@
 import math
 import warnings
 from collections.abc import Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -29,6 +30,12 @@ from vllm.v1.watermarking.watermarker import (
     SupportsSpeculativeDecoding,
     Watermarker,
     WatermarkSample,
+)
+from vllm.v1.watermarking.weighting import (
+    _WEIGHT_LEVELS,
+    WordStartWeights,
+    _weighted_tail,
+    surprisal_levels,
 )
 
 
@@ -217,6 +224,100 @@ class GumbelWatermarkDetector(WatermarkDetector):
 
     def _aggregate_scores(self, token_scores: torch.Tensor) -> float:
         return token_scores.sum().item()
+
+
+class WeightedGumbelWatermarkDetector(GumbelWatermarkDetector):
+    """``GumbelWatermarkDetector`` with two weighted tests, which sum
+    ``w * -log(1 - U)`` with weights from 1 to 3.5 in steps of 0.25 and report
+    the tail of that sum for independent Exp(1) scores (saddlepoint
+    approximation): AutoMark's surprisal weights, given a detection model's
+    log-probabilities (``detect(token_ids, logprobs)``), or text-only weights,
+    ``word_start_weight`` for tokens that start a word or follow a sentence end
+    (``tokenizer`` required). Without either it is the plain test.
+    """
+
+    def __init__(
+        self,
+        key: int,
+        context_width: int = 4,
+        p_value_threshold: float = 0.01,
+        prf: WatermarkPRF | WatermarkPRFName = "philox",
+        deduplicate_contexts: bool = True,
+        tokenizer: Any = None,
+        word_start_weight: float = 1.0,
+    ) -> None:
+        super().__init__(
+            key, context_width, p_value_threshold, prf, deduplicate_contexts
+        )
+        self.word_starts = None
+        if word_start_weight != 1.0:
+            if tokenizer is None:
+                raise ValueError("word_start_weight needs the tokenizer")
+            self.word_starts = WordStartWeights(tokenizer, word_start_weight)
+
+    def detect(
+        self,
+        token_ids: list[int],
+        logprobs: Sequence[float | None] | None = None,
+    ) -> WatermarkDetection:
+        """Test generated ``token_ids``, excluding the prompt. With
+        ``logprobs``, ``logprobs[i]`` is a detection model's log-probability
+        of ``token_ids[i]`` (or None), and each score weighs ``1 + min(-logprob,
+        2.5)``, rounded to steps of 0.25."""
+        if logprobs is None and self.word_starts is None:
+            return super().detect(token_ids)
+        if logprobs is not None and self.word_starts is not None:
+            raise ValueError("logprobs and word_start_weight are exclusive")
+        if logprobs is not None and len(logprobs) != len(token_ids):
+            raise ValueError(
+                f"logprobs must hold one value per token, got {len(logprobs)} "
+                f"for {len(token_ids)} tokens"
+            )
+        positions = self._scored_positions(token_ids)
+        if not positions:
+            return WatermarkDetection(0.0, 1.0, 0, False)
+        contexts, targets = self._pairs(token_ids, positions)
+        if logprobs is not None:
+            levels = surprisal_levels([logprobs[p] for p in positions])
+        else:
+            assert self.word_starts is not None
+            levels = self.word_starts.levels(token_ids, positions)
+        scores = self._score_tokens(contexts, targets)
+        score = (_WEIGHT_LEVELS[levels] * scores).sum().item()
+        hist = torch.bincount(levels, minlength=len(_WEIGHT_LEVELS))
+        p_value = _weighted_tail(score, hist)
+        return WatermarkDetection(
+            score, p_value, len(positions), p_value <= self.p_value_threshold
+        )
+
+    def _scored_positions(self, token_ids: list[int]) -> list[int]:
+        """Positions ``_prepare_inputs`` scores: every token, its context
+        padded with -1 before the output, repeated contexts skipped when
+        ``deduplicate_contexts``."""
+        width = self.context_width
+        padded = [-1] * width + list(token_ids)
+        seen: set[tuple[int, ...]] = set()
+        positions = []
+        for position in range(len(token_ids)):
+            context = tuple(padded[position : position + width])
+            if self.deduplicate_contexts:
+                if context in seen:
+                    continue
+                seen.add(context)
+            positions.append(position)
+        return positions
+
+    def _pairs(
+        self, token_ids: list[int], positions: list[int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        width = self.context_width
+        padded = [-1] * width + list(token_ids)
+        return (
+            torch.tensor(
+                [padded[p : p + width] for p in positions], dtype=torch.int64
+            ).reshape(-1, width),
+            torch.tensor([token_ids[p] for p in positions], dtype=torch.int64),
+        )
 
 
 class DualKeyGumbelWatermarkDetector(GumbelWatermarkDetector):

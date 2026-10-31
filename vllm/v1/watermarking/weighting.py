@@ -3,10 +3,11 @@
 
 """Per-token weights for weighted detection tests, on ConcordMark's grid of
 weights 1, 1.25, ..., 3.5 (levels 0 to 10), whose weighted Exp(1) sums have a
-saddlepoint tail (`concordmark._weighted_tail`).
+saddlepoint tail (`_weighted_tail`). The grid and the tail live here so that
+every detector can use them; ConcordMark's high mode imports them.
 
 Two weightings: AutoMark's surprisal weights (Gloaguen et al., 2026), from a
-detection model's log-probability of each token, and a text-only one that
+detection model's log-probabilities of each token, and a text-only one that
 weighs tokens starting a word or a sentence."""
 
 import math
@@ -16,12 +17,54 @@ from typing import Any
 import regex as re
 import torch
 
-from vllm.v1.watermarking.concordmark import _WEIGHT_LEVELS
-
+# High-mode weights 1 + min(surprisal, 2.5), quantised to steps of 0.25.
+_WEIGHT_LEVELS = 1.0 + 0.25 * torch.arange(11, dtype=torch.float64)
 _LEVEL_STEP = 0.25
 _MAX_SURPRISAL = 2.5
 _SENTENCE_END = ".!?:;"
 _BYTE_TOKEN = re.compile("<0x([0-9A-Fa-f]{2})>")
+
+
+def _gamma_tail(shape: torch.Tensor | float, value: float) -> torch.Tensor:
+    shape = torch.as_tensor(shape, dtype=torch.float64)
+    return torch.special.gammaincc(shape, torch.tensor(value, dtype=torch.float64))
+
+
+def _weighted_tail(total: float, hist: torch.Tensor) -> float:
+    """`P[sum_j w_j E_j >= total]` for i.i.d. `E_j ~ Exp(1)` and `hist[l]`
+    weights `_WEIGHT_LEVELS[l]`: exact for one weight, else Lugannani-Rice."""
+    terms = [(w, c) for w, c in zip(_WEIGHT_LEVELS.tolist(), hist.tolist()) if c]
+    if total <= 0 or not terms:
+        return 1.0
+    if len(terms) == 1:
+        return _gamma_tail(terms[0][1], total / terms[0][0]).item()
+
+    mean = sum(w * c for w, c in terms)
+    # Bisect K'(theta) = total; K' increases up to its pole at 1 / max(w).
+    if total >= mean:
+        lower = 0.0
+        upper = min(
+            min((1 - c * w / total) / w for w, c in terms), 1 / max(w for w, _ in terms)
+        )
+    else:
+        lower, upper = (1 - mean / total) / min(w for w, _ in terms), 0.0
+    for _ in range(64):
+        theta = (lower + upper) / 2
+        if sum(c * w / (1 - w * theta) for w, c in terms) < total:
+            lower = theta
+        else:
+            upper = theta
+    theta = (lower + upper) / 2
+
+    cgf = -sum(c * math.log(1 - w * theta) for w, c in terms)
+    curve = sum(c * (w / (1 - w * theta)) ** 2 for w, c in terms)
+    w_hat = math.copysign(math.sqrt(max(2 * (theta * total - cgf), 0.0)), theta)
+    u_hat = theta * math.sqrt(curve)
+    if abs(w_hat) < 1e-6 or u_hat == 0:
+        return 0.5  # The removable singularity at total = E[T].
+    density = math.exp(-w_hat * w_hat / 2) / math.sqrt(2 * math.pi)
+    tail = math.erfc(w_hat / math.sqrt(2)) / 2 + density * (1 / u_hat - 1 / w_hat)
+    return min(max(tail, 0.0), 1.0) if math.isfinite(tail) else 0.5
 
 
 def weight_level(weight: float) -> int:
