@@ -555,6 +555,63 @@ result = GaussianCopulaWatermarkDetector(key=42, context_width=2).detect(token_i
 The Gaussian copula watermark does not support
 [speculative decoding](#speculative-decoding).
 
+### TextSeal2
+
+TextSeal2 ([arXiv:2610.40613](https://arxiv.org/abs/2610.40613)) is the
+Gaussian copula watermark on a virtual key that mixes two keys derived from the
+master key, A and B: every candidate gets
+`G* = (ndtri(U_A) + ndtri(U_B)) / sqrt(2)` and races on
+`z = correlation * G* + sqrt(1 - correlation**2) * N`. Tokens follow the
+model's distribution, as for the copula. `correlation` defaults to 0.9, the
+paper's value. The first `context_width` tokens of an output and repeated
+contexts are sampled without the watermark:
+
+```bash
+vllm serve MODEL \
+  --watermark-config '{"algorithm":"textseal2","key":42}'
+```
+
+Detection scores every distinct (context, token) pair once. The private
+detector, which needs the master key, sums `-log Phi(-G*)`; the public
+detector needs only key A and sums `-log(1 - U_A)`, with `1 / sqrt(2)` of the
+signal. Both report the Gamma tail of the sum. With per-token entropies they
+run TextSeal's entropy-weighted test, and `detect_localized` runs TextSeal's
+localized detection:
+
+```python
+from vllm.v1.watermarking import TextSeal2WatermarkDetector
+
+detector = TextSeal2WatermarkDetector(key=42)
+private = detector.detect(token_ids)
+public = TextSeal2WatermarkDetector(detector.public_key, public=True).detect(token_ids)
+```
+
+Under speculative decoding TextSeal2 follows the paper's rule: the drafter
+races every draft on the key, and verification runs one more race, on the
+leftovers of the drafts' clocks, that decides where the drafted path stops and
+which token is emitted there. The output keeps the model's distribution, the
+acceptance is that of block verification (`"verification_law": "token"` for
+token-level verification), and every emitted token is watermarked. The noise
+of a draft race and of its verification is a public function of the request
+seed, the position and the draft step, so the two agree without extra state.
+`"keyed_drafts": false` leaves the drafts unwatermarked instead, and accepts
+each draft with its target probability. `pass_aggregator` (`tsum`, `expsum` or
+`max`) adds a lookahead on the race, outside the paper, that keeps the output
+distribution and acceptance and raises the scores of kept drafts:
+
+```bash
+vllm serve MODEL \
+  --speculative-config \
+  '{"method":"mtp","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}' \
+  --watermark-config '{"algorithm":"textseal2","key":42,"context_width":4}'
+```
+
+`lookahead_textseal2` verifies unwatermarked drafts with lookahead Gumbel-max's
+recursion on TextSeal2's noise instead, with `aggregator` and
+`aggregator_lambda` as for the other lookahead watermarks. Both rules read the
+clocks of rows they then discard, so `context_width` should be at least
+`num_speculative_tokens`.
+
 ## Pseudorandom functions
 
 A watermark PRF turns the secret key, token context, and candidate token into

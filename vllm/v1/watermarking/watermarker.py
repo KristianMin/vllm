@@ -133,3 +133,28 @@ class SupportsVerificationLogits(Protocol):
         Rows in ``skip_mask`` must keep their logits.
         """
         ...
+
+
+@runtime_checkable
+class SupportsResidualVerification(Protocol):
+    """A watermarker whose verification also reads the drafts' distributions
+    and the request seeds and positions the drafts were raced with
+    (TextSeal2's speculative rule). Used instead of ``verification_logits``
+    when the drafts were sampled probabilistically."""
+
+    def residual_verification_logits(
+        self,
+        logits: torch.Tensor,
+        contexts: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+        skip_mask: torch.Tensor,
+        draft_logits: torch.Tensor,
+        random_sampler: RandomSampler,
+    ) -> torch.Tensor:
+        """As ``SupportsVerificationLogits.verification_logits``.
+        ``draft_logits`` [num_logits, vocab] are the temperature-scaled draft
+        logits each draft row's draft was sampled from (arbitrary at bonus
+        rows), and ``random_sampler`` holds each row's request seed and
+        position."""
+        ...

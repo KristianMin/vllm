@@ -17,8 +17,9 @@ The rule needs only that every row races on standard Gumbels independent across
 its candidates and of the rows below, so it applies unchanged to the
 Gumbel-max watermarks that draw their Gumbels differently: TextSeal's dual-key
 Gumbel-max, whose rows race on key A's or, with probability ``alpha``, key B's
-Gumbels, and the Gaussian copula watermark, whose Gumbels mix the keyed uniform
-with fresh Gaussian noise.
+Gumbels, the Gaussian copula watermark, whose Gumbels mix the keyed uniform
+with fresh Gaussian noise, and TextSeal2, the copula on the virtual key of two
+keys.
 """
 
 import functools
@@ -35,6 +36,11 @@ from vllm.v1.watermarking.gaussian_copula import (
 from vllm.v1.watermarking.gaussian_copula import gumbels as copula_gumbels
 from vllm.v1.watermarking.gumbel import DualKeyGumbelWatermarker, GumbelWatermarker
 from vllm.v1.watermarking.prfs import PhiloxPRF, WatermarkPRF, create_prf
+from vllm.v1.watermarking.textseal2 import (
+    DEFAULT_CORRELATION as TEXTSEAL2_DEFAULT_CORRELATION,
+)
+from vllm.v1.watermarking.textseal2 import TextSeal2Watermarker
+from vllm.v1.watermarking.textseal2 import race_gumbels as textseal2_gumbels
 from vllm.v1.watermarking.watermarker import RandomSampler, WatermarkSample
 
 AGGREGATORS = ("pi1", "pi2", "max", "tsum", "min", "lin", "expsum")
@@ -45,6 +51,7 @@ _REARRANGED_SAMPLES = 2_000_000
 # seeds. Public: the randomness needs no secrecy.
 _KEY_COIN_SEED = 0x4C4B41434F494E
 _COPULA_NOISE_SEED = 0x4C4B41434F50
+_TEXTSEAL2_NOISE_SEED = 0x4C4B54533200
 
 
 @functools.cache
@@ -439,3 +446,97 @@ class LookaheadGaussianCopulaWatermarker(LookaheadGumbelWatermarker):
         )
         noise = torch.randn(uniforms.shape, device=uniforms.device, generator=generator)
         return copula_gumbels(uniforms, noise, self.correlation)
+
+
+class LookaheadTextSeal2Watermarker(LookaheadGumbelWatermarker):
+    """TextSeal2 (``textseal2``) with lookahead verification.
+
+    Without speculation it samples like ``textseal2``. In speculative
+    verification every row races on TextSeal2's Gumbels ``-log(-log Phi(z_u))``
+    with ``z_u = correlation * G*_u + sqrt(1 - correlation**2) * N_u``, where
+    ``G*_u`` is the virtual key of keys A and B. These are standard Gumbels
+    independent across candidates and rows, so the path is decided as in
+    lookahead Gumbel-max and every row stays an exact sample, for drafts that
+    do not depend on the key. Rows whose context reaches before the output are
+    verified without the watermark, as ``textseal2`` samples them. Detection is
+    ``TextSeal2WatermarkDetector``. This is the rule of the reference's
+    ``LookaheadTextSeal2Watermark``, an alternative to the paper's speculative
+    rule (keyed drafts and a residual race), not a layer on top of it.
+
+    A discarded row's race decides its parent's, so its keyed values must not
+    be raced on again as fresh: ``context_width`` should be at least the number
+    of drafts, so that a row of the next step at the same position differs from
+    every discarded row in the token where the output left the drafted path.
+
+    Verification receives no per-request seeds, so its fresh noise ``N`` comes
+    from a generator the watermarker owns.
+    """
+
+    races_on_prf_gumbels = False
+
+    def __init__(
+        self,
+        key: int,
+        context_width: int = 4,
+        prf: WatermarkPRFName = "philox",
+        correlation: float = TEXTSEAL2_DEFAULT_CORRELATION,
+        aggregator: str = "tsum",
+        aggregator_lambda: float = 1.0,
+    ) -> None:
+        self.sampling_watermarker = TextSeal2Watermarker(
+            key, context_width, prf, correlation
+        )
+        super().__init__(
+            key,
+            context_width,
+            self.sampling_watermarker.prf,
+            aggregator,
+            aggregator_lambda,
+        )
+        self.key_b_prf = self.sampling_watermarker.key_b_prf
+        self.correlation = correlation
+        self._generators: dict[torch.device, torch.Generator] = {}
+
+    def sample(
+        self,
+        logits: torch.Tensor,
+        contexts: torch.Tensor,
+        random_sampler: RandomSampler | None = None,
+        skip_mask: torch.Tensor | None = None,
+    ) -> WatermarkSample:
+        return self.sampling_watermarker.sample(
+            logits, contexts, random_sampler, skip_mask
+        )
+
+    def _sample_watermarked(
+        self,
+        logits: torch.Tensor,
+        contexts: torch.Tensor,
+    ) -> WatermarkSample:
+        return self.sampling_watermarker._sample_watermarked(logits, contexts)
+
+    def verification_logits(
+        self,
+        logits: torch.Tensor,
+        contexts: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+        skip_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        partial = (contexts < 0).any(dim=-1)
+        return super().verification_logits(
+            logits, contexts, draft_tokens, cu_num_logits, skip_mask | partial
+        )
+
+    def fresh_noise(self, shape: torch.Size, device: torch.device) -> torch.Tensor:
+        """Standard normal float64 noise of the verification races."""
+        generator = _fresh_generator(self._generators, device, _TEXTSEAL2_NOISE_SEED)
+        return torch.randn(
+            shape, dtype=torch.float64, device=device, generator=generator
+        )
+
+    def race_gumbels(self, contexts: torch.Tensor, vocab_size: int) -> torch.Tensor:
+        vocabulary = torch.arange(vocab_size, device=contexts.device)
+        virtual = self.sampling_watermarker.virtual_key(contexts, vocabulary)
+        noise = self.fresh_noise(virtual.shape, contexts.device)
+        return textseal2_gumbels(virtual, noise, self.correlation).float()
