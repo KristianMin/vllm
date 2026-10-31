@@ -12,6 +12,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.watermarking.concordmark import ConcordMarkWatermarker
 from vllm.v1.watermarking.watermarker import (
     RandomSampler,
+    SupportsResidualVerification,
     SupportsVerificationLogits,
     Watermarker,
 )
@@ -167,14 +168,19 @@ class GPUWatermarkSampler(Sampler):
         expanded_local_pos: torch.Tensor,
         draft_sampled: torch.Tensor,
         cu_num_logits: torch.Tensor,
+        draft_logits: torch.Tensor | None = None,
+        pos: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The logits rejection sampling verifies, from the watermarker's
-        ``verification_logits``.
+        ``verification_logits``, or its ``residual_verification_logits`` when
+        it has one and the drafts were sampled probabilistically.
 
         ``draft_sampled`` holds each row's input token, so the draft row ``i``
         verifies is ``draft_sampled[i + 1]``, and each row's context ends with
-        the drafted tokens before it. Opted-out, greedy and deduplicated rows
-        keep their logits.
+        the drafted tokens before it. ``draft_logits`` is the drafter's
+        pre-temperature logits cache [max_num_reqs, num_speculative_steps,
+        vocab] and ``pos`` each row's position. Opted-out, greedy and
+        deduplicated rows keep their logits.
         """
         assert isinstance(self.watermarker, SupportsVerificationLogits)
         contexts = self._get_contexts(
@@ -186,6 +192,33 @@ class GPUWatermarkSampler(Sampler):
         if self.deduplicate_contexts != "none":
             enabled &= ~self._get_repeated_contexts(
                 expanded_idx_mapping, contexts, expanded_local_pos
+            )
+        if (
+            draft_logits is not None
+            and pos is not None
+            and isinstance(self.watermarker, SupportsResidualVerification)
+        ):
+            requests = expanded_idx_mapping.long().clamp_min(0)
+            steps = expanded_local_pos.long().clamp(0, draft_logits.shape[1] - 1)
+            temperatures = self.sampling_states.temperature.gpu[requests]
+            temperatures = torch.where(temperatures == 0, 1, temperatures)
+            row_draft_logits = draft_logits[
+                requests, steps, : processed_logits.shape[-1]
+            ].float() / temperatures.unsqueeze(-1)
+            return self.watermarker.residual_verification_logits(
+                processed_logits,
+                contexts,
+                draft_sampled.roll(-1),
+                cu_num_logits,
+                ~enabled,
+                row_draft_logits,
+                RandomSampler(
+                    expanded_idx_mapping=expanded_idx_mapping,
+                    temperatures=self.sampling_states.temperature.gpu,
+                    seeds=self.sampling_states.seeds.gpu,
+                    positions=pos,
+                    use_fp64=self.use_fp64_gumbel,
+                ),
             )
         return self.watermarker.verification_logits(
             processed_logits,

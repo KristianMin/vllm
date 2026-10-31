@@ -8,6 +8,9 @@ import torch
 from vllm.config.watermarking import WatermarkConfig
 from vllm.v1.watermarking.chi_squared import ChiSquaredWatermarker
 from vllm.v1.watermarking.concordmark import ConcordMarkWatermarker
+from vllm.v1.watermarking.gaussian_copula import (
+    DEFAULT_CORRELATION as COPULA_DEFAULT_CORRELATION,
+)
 from vllm.v1.watermarking.gaussian_copula import GaussianCopulaWatermarker
 from vllm.v1.watermarking.gumbel import (
     DualKeyGumbelWatermarker,
@@ -17,6 +20,7 @@ from vllm.v1.watermarking.lookahead import (
     LookaheadDualKeyGumbelWatermarker,
     LookaheadGaussianCopulaWatermarker,
     LookaheadGumbelWatermarker,
+    LookaheadTextSeal2Watermarker,
 )
 from vllm.v1.watermarking.lookahead_ppl import LookaheadPPLSoftWatermarker
 from vllm.v1.watermarking.lookahead_textgrain import LookaheadTextGrainWatermarker
@@ -26,6 +30,13 @@ from vllm.v1.watermarking.red_green import RedGreenWatermarker, UnigramWatermark
 from vllm.v1.watermarking.rotation_first import RotationFirstWatermarker
 from vllm.v1.watermarking.synthid import SynthIDWatermarker
 from vllm.v1.watermarking.textgrain import TextGrainWatermarker
+from vllm.v1.watermarking.textseal2 import (
+    DEFAULT_CORRELATION as TEXTSEAL2_DEFAULT_CORRELATION,
+)
+from vllm.v1.watermarking.textseal2 import (
+    TextSeal2SpeculativeWatermarker,
+    TextSeal2VerificationWatermarker,
+)
 from vllm.v1.watermarking.watermarker import Watermarker
 
 if TYPE_CHECKING:
@@ -47,8 +58,14 @@ def create_watermarker(
             config.prf,
             config.alpha,
         )
-    # Each algorithm has its own default delta.
+    # Each algorithm has its own default delta and correlation.
     delta: dict[str, Any] = {} if config.delta is None else {"delta": config.delta}
+    if config.correlation is not None:
+        correlation = config.correlation
+    elif config.algorithm in ("textseal2", "lookahead_textseal2"):
+        correlation = TEXTSEAL2_DEFAULT_CORRELATION
+    else:
+        correlation = COPULA_DEFAULT_CORRELATION
     if config.algorithm == "red_green":
         return RedGreenWatermarker(
             config.key,
@@ -95,7 +112,16 @@ def create_watermarker(
             config.key,
             config.context_width,
             config.prf,
-            config.correlation,
+            correlation,
+            config.aggregator,
+            config.aggregator_lambda,
+        )
+    if config.algorithm == "lookahead_textseal2":
+        return LookaheadTextSeal2Watermarker(
+            config.key,
+            config.context_width,
+            config.prf,
+            correlation,
             config.aggregator,
             config.aggregator_lambda,
         )
@@ -152,7 +178,29 @@ def create_watermarker(
             config.key,
             config.context_width,
             config.prf,
-            config.correlation,
+            correlation,
+        )
+    if config.algorithm == "textseal2":
+        speculative_rule = {
+            "law": config.verification_law,
+            "pass_aggregator": config.pass_aggregator,
+            "pass_source": config.pass_source,
+        }
+        if config.keyed_drafts:
+            return TextSeal2SpeculativeWatermarker(
+                config.key,
+                config.context_width,
+                config.prf,
+                correlation,
+                **speculative_rule,
+            )
+        return TextSeal2VerificationWatermarker(
+            config.key,
+            config.context_width,
+            config.prf,
+            correlation,
+            keyed_drafts=False,
+            **speculative_rule,
         )
     if config.algorithm == "rotation_first":
         from vllm.tokenizers import cached_tokenizer_from_config

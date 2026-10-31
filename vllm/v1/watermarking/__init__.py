@@ -25,6 +25,7 @@ from vllm.v1.watermarking.lookahead import (
     LookaheadDualKeyGumbelWatermarker,
     LookaheadGaussianCopulaWatermarker,
     LookaheadGumbelWatermarker,
+    LookaheadTextSeal2Watermarker,
 )
 from vllm.v1.watermarking.lookahead_ppl import LookaheadPPLSoftWatermarker
 from vllm.v1.watermarking.lookahead_textgrain import LookaheadTextGrainWatermarker
@@ -57,7 +58,14 @@ from vllm.v1.watermarking.textgrain import (
     TextGrainWatermarkDetector,
     TextGrainWatermarker,
 )
+from vllm.v1.watermarking.textseal2 import (
+    TextSeal2SpeculativeWatermarker,
+    TextSeal2VerificationWatermarker,
+    TextSeal2WatermarkDetector,
+    TextSeal2Watermarker,
+)
 from vllm.v1.watermarking.watermarker import (
+    SupportsResidualVerification,
     SupportsSpeculativeDecoding,
     SupportsVerificationLogits,
     Watermarker,
@@ -81,6 +89,7 @@ __all__ = [
     "LookaheadDualKeyGumbelWatermarker",
     "LookaheadGaussianCopulaWatermarker",
     "LookaheadGumbelWatermarker",
+    "LookaheadTextSeal2Watermarker",
     "LookaheadPPLSoftWatermarker",
     "LookaheadTextGrainWatermarker",
     "PPLHardWatermarker",
@@ -91,12 +100,17 @@ __all__ = [
     "RotationFirstWatermarker",
     "RedGreenWatermarkDetector",
     "RedGreenWatermarker",
+    "SupportsResidualVerification",
     "SupportsSpeculativeDecoding",
     "SupportsVerificationLogits",
     "SynthIDWatermarkDetector",
     "SynthIDWatermarker",
     "TextGrainWatermarkDetector",
     "TextGrainWatermarker",
+    "TextSeal2SpeculativeWatermarker",
+    "TextSeal2VerificationWatermarker",
+    "TextSeal2WatermarkDetector",
+    "TextSeal2Watermarker",
     "UnigramWatermarkDetector",
     "UnigramWatermarker",
     "WatermarkDetection",

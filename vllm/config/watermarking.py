@@ -21,6 +21,7 @@ WatermarkingAlgorithm = Literal[
     "lookahead_gumbel",
     "lookahead_dual_key_gumbel",
     "lookahead_gaussian_copula",
+    "lookahead_textseal2",
     "lookahead_ppl_soft",
     "lookahead_textgrain",
     "chi_squared",
@@ -29,6 +30,7 @@ WatermarkingAlgorithm = Literal[
     "synthid",
     "textgrain",
     "gaussian_copula",
+    "textseal2",
     "rotation_first",
     "concordmark",
 ]
@@ -63,10 +65,12 @@ class WatermarkConfig:
     """Algorithm used to watermark generated text."""
     alpha: float = Field(default=0.1, ge=0, le=1)
     """Probability of selecting key B for dual-key watermarking."""
-    correlation: float = Field(default=0.98551, gt=0, le=1)
-    """Keyed share of the Gaussian behind the Gumbel noise of Gaussian copula
-    watermarking; 1 makes the noise fully keyed. The default is AutoMark's,
-    chosen to match the quality of TextSeal at alpha 0.1."""
+    correlation: float | None = Field(default=None, gt=0, le=1)
+    """Keyed share of the Gaussian behind the Gumbel noise of the Gaussian
+    copula watermarks; 1 makes the noise fully keyed. Each algorithm has its
+    own default: 0.98551 for `gaussian_copula` and `lookahead_gaussian_copula`,
+    AutoMark's value chosen to match the quality of TextSeal at alpha 0.1, and
+    0.9 for `textseal2` and `lookahead_textseal2`, the TextSeal2 paper's."""
     delta: float | None = Field(default=None, gt=0)
     """Strength of the logit-bias and chi-squared watermarks; each algorithm
     has its own default: the bias added to green-list tokens for `red_green`
@@ -83,18 +87,38 @@ class WatermarkConfig:
     """Number of message bits embedded by multi-bit red-green watermarking."""
     aggregator: LookaheadAggregator = "tsum"
     """How a lookahead watermark combines a drafted token's own randomness with
-    what the row below sends up. `lookahead_gumbel`, `lookahead_dual_key_gumbel`
-    and `lookahead_gaussian_copula`: `pi1` is the plain watermark, `pi2` takes
-    the child's race value, `max`, `tsum`, `min`, `lin` and `expsum` mix both
-    while keeping the result a standard Gumbel. `lookahead_ppl_soft`:
-    `pi1` is plain `ppl_soft`, `pi2`, `tsum`, `max` and `gauss` combine the rank
-    of the drafted token's score with the rank the row below sends up, and
-    `optpath` races it on its own score plus the realized score of the path
-    below."""
+    what the row below sends up. `lookahead_gumbel`, `lookahead_dual_key_gumbel`,
+    `lookahead_gaussian_copula` and `lookahead_textseal2`: `pi1` is the plain
+    watermark, `pi2` takes the child's race value, `max`, `tsum`, `min`, `lin`
+    and `expsum` mix both while keeping the result a standard Gumbel.
+    `lookahead_ppl_soft`: `pi1` is plain `ppl_soft`, `pi2`, `tsum`, `max` and
+    `gauss` combine the rank of the drafted token's score with the rank the row
+    below sends up, and `optpath` races it on its own score plus the realized
+    score of the path below."""
     aggregator_lambda: float = Field(default=1.0, gt=0)
     """Weight of the child's value in the `lin` (`lookahead_gumbel` and its
-    dual-key and Gaussian copula variants) and `gauss` (`lookahead_ppl_soft`)
-    lookahead aggregators."""
+    dual-key, Gaussian copula and TextSeal2 variants) and `gauss`
+    (`lookahead_ppl_soft`) lookahead aggregators."""
+    keyed_drafts: bool = True
+    """Whether `textseal2` under speculative decoding races each draft on the
+    key, the paper's rule: verification then runs TextSeal2's residual race on
+    the leftovers of the drafts' clocks, which keeps block verification's
+    acceptance and watermarks every emitted token. False leaves the drafts
+    unwatermarked and runs the residual race on them as point masses, which
+    accepts each draft with its target probability."""
+    verification_law: Literal["block", "token"] = "block"
+    """Verification law `textseal2`'s residual race follows under speculative
+    decoding: `block` verification, the paper's rule, or `token`-level
+    verification, which accepts fewer drafts."""
+    pass_aggregator: Literal["none", "tsum", "expsum", "max"] = "none"
+    """TextSeal2's lookahead on its residual race under speculative decoding,
+    not in the paper: `none` is the paper's rule; `tsum`, `expsum` and `max`
+    mix each draft race's time into the race's backward chain, which keeps the
+    output distribution and the acceptance and raises the scores of kept
+    drafts."""
+    pass_source: Literal["own", "child"] = "own"
+    """Whose draft race time `pass_aggregator` mixes into a row's pass clock:
+    the row's own draft's (`own`) or the next draft's (`child`)."""
     lookahead_reward_samples: int = Field(default=64, ge=2)
     """Size of each of the two reference samples `lookahead_textgrain` draws of
     a child's expected-reward message to calibrate its parent (each costs that
@@ -121,7 +145,12 @@ class WatermarkConfig:
     """Number of prior tokens used by the watermark PRF. Ignored by `unigram`,
     whose green list takes no context, and by `rotation_first`, which keys
     clocks by the previous token class. For `concordmark`, the widest window of
-    its context ladder."""
+    its context ladder. `lookahead_textseal2`, and `textseal2` under
+    speculative decoding, should use at least `num_speculative_tokens`: then a
+    row discarded in one verification step and a row of the next step at the
+    same position differ in the token where the output left the drafted path,
+    so keyed values that a discarded race already used do not come back at that
+    position."""
     deduplicate_contexts: WatermarkContextScope = "single_turn"
     """Which history is searched for a repeated context before a token is
     sampled; a repeated context is sampled without the watermark. `none`
@@ -152,9 +181,11 @@ class WatermarkConfig:
             "lookahead_gumbel",
             "lookahead_dual_key_gumbel",
             "lookahead_gaussian_copula",
+            "lookahead_textseal2",
             "lookahead_ppl_soft",
             "lookahead_textgrain",
             "textgrain",
+            "textseal2",
         )
 
     @property
@@ -182,6 +213,7 @@ class WatermarkConfig:
                 "lookahead_gumbel",
                 "lookahead_dual_key_gumbel",
                 "lookahead_gaussian_copula",
+                "lookahead_textseal2",
             )
             and self.aggregator not in LOOKAHEAD_GUMBEL_AGGREGATORS
             and not (
@@ -223,6 +255,8 @@ class WatermarkConfig:
             "lookahead_ppl_soft",
             "gaussian_copula",
             "lookahead_gaussian_copula",
+            "textseal2",
+            "lookahead_textseal2",
         ) and (self.deduplicate_contexts == "none" or history_is_too_short):
             # These favor the same token whenever the key and context recur.
             name = {
@@ -231,6 +265,8 @@ class WatermarkConfig:
                 "lookahead_ppl_soft": "Lookahead soft perplexity",
                 "gaussian_copula": "Gaussian copula",
                 "lookahead_gaussian_copula": "Lookahead Gaussian copula",
+                "textseal2": "TextSeal2",
+                "lookahead_textseal2": "Lookahead TextSeal2",
             }.get(self.algorithm, "Gumbel-max")
             logger.warning_once(
                 f"{name} watermarking with context deduplication "

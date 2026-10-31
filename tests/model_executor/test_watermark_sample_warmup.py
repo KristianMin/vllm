@@ -375,6 +375,42 @@ def test_textgrain_warms_its_sampling_path(
     }
 
 
+@pytest.mark.parametrize("algorithm", ["textseal2", "lookahead_textseal2"])
+@pytest.mark.parametrize("speculative", [False, True])
+def test_textseal2_warms_its_sampling_path(
+    monkeypatch: pytest.MonkeyPatch, algorithm: str, speculative: bool
+) -> None:
+    """TextSeal2 launches its kernel from ``sample`` (the lookahead variant and
+    the speculative rule's verifier sample with TextSeal2), so the warmup
+    samples it once per logits dtype and launches no Gumbel kernel."""
+    gumbel_calls = _capture_calls(monkeypatch)
+    worker = _worker(
+        WatermarkConfig(key=MASTER_KEY, algorithm=algorithm), speculative=speculative
+    )
+    watermarker = worker.model_runner.sampler.watermarker
+    watermarker = getattr(watermarker, "sampling_watermarker", watermarker)
+    calls: list[torch.dtype] = []
+    monkeypatch.setattr(
+        watermarker,
+        "sample",
+        lambda logits, contexts, random_sampler, skip_mask=None: calls.append(
+            logits.dtype
+        ),
+    )
+    if algorithm == "lookahead_textseal2":
+        monkeypatch.setattr(
+            worker.model_runner.sampler.watermarker,
+            "verification_logits",
+            lambda *args: None,
+        )
+        worker.vllm_config.speculative_config = object() if speculative else None
+
+    watermark_sample_warmup(worker)
+
+    assert gumbel_calls == []
+    assert set(calls) == {torch.bfloat16, torch.float32}
+
+
 def test_warmup_argument_dtypes_match_the_runtime_buffers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
