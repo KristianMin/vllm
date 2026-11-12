@@ -31,6 +31,7 @@ WatermarkingAlgorithm = Literal[
     "textgrain",
     "gaussian_copula",
     "textseal2",
+    "block_verified_gumbel",
     "rotation_first",
     "concordmark",
 ]
@@ -106,16 +107,23 @@ class WatermarkConfig:
     acceptance and watermarks every emitted token. False leaves the drafts
     unwatermarked and runs the residual race on them as point masses, which
     accepts each draft with its target probability."""
-    verification_law: Literal["block", "token"] = "block"
-    """Verification law `textseal2`'s residual race follows under speculative
-    decoding: `block` verification, the paper's rule, or `token`-level
-    verification, which accepts fewer drafts."""
-    pass_aggregator: Literal["none", "tsum", "expsum", "max"] = "none"
-    """TextSeal2's lookahead on its residual race under speculative decoding,
-    not in the paper: `none` is the paper's rule; `tsum`, `expsum` and `max`
-    mix each draft race's time into the race's backward chain, which keeps the
-    output distribution and the acceptance and raises the scores of kept
-    drafts."""
+    verification_law: Literal["block", "token", "shared"] = "block"
+    """Verification law the residual race of `textseal2` and
+    `block_verified_gumbel` follows under speculative decoding: `block`
+    verification (the TextSeal2 paper's rule) or `token`-level verification,
+    which accepts fewer drafts. `shared` (`block_verified_gumbel` only) is the
+    baseline that verifies the keyed drafts on the shared clocks: every row
+    emits its own Gumbel-max token and a draft is kept iff it equals it."""
+    pass_aggregator: Literal["none", "identity", "tsum", "expsum", "max"] = "none"
+    """The lookahead on the residual race of `textseal2` and
+    `block_verified_gumbel` under speculative decoding (not in the TextSeal2
+    paper): `none` is the one-shot race on the leftovers (the paper's rule);
+    `identity`, `tsum`, `expsum` and `max` put each draft race's time into the
+    race's backward chain (`identity` alone, the others mixed with the later
+    rows' time), which keeps the output distribution and the acceptance and
+    raises the scores of kept drafts. With point-mass drafts, `identity`,
+    `none`, `max` and `tsum` are lookahead Gumbel-max's `pi1`, `pi2`, `max` and
+    `tsum`."""
     pass_source: Literal["own", "child"] = "own"
     """Whose draft race time `pass_aggregator` mixes into a row's pass clock:
     the row's own draft's (`own`) or the next draft's (`child`)."""
@@ -150,7 +158,7 @@ class WatermarkConfig:
     row discarded in one verification step and a row of the next step at the
     same position differ in the token where the output left the drafted path,
     so keyed values that a discarded race already used do not come back at that
-    position."""
+    position. The same holds for `block_verified_gumbel`."""
     deduplicate_contexts: WatermarkContextScope = "single_turn"
     """Which history is searched for a repeated context before a token is
     sampled; a repeated context is sampled without the watermark. `none`
@@ -186,6 +194,7 @@ class WatermarkConfig:
             "lookahead_textgrain",
             "textgrain",
             "textseal2",
+            "block_verified_gumbel",
         )
 
     @property
@@ -239,6 +248,12 @@ class WatermarkConfig:
                 "lookahead_ppl_soft supports the aggregators "
                 f"{LOOKAHEAD_PPL_AGGREGATORS}"
             )
+        if self.verification_law == "shared" and self.algorithm != (
+            "block_verified_gumbel"
+        ):
+            raise ValueError(
+                "verification_law='shared' is only defined for block_verified_gumbel"
+            )
         if self.algorithm == "rotation_first":
             self.deduplicate_contexts = "none"
             return self
@@ -258,6 +273,7 @@ class WatermarkConfig:
             "lookahead_gaussian_copula",
             "textseal2",
             "lookahead_textseal2",
+            "block_verified_gumbel",
         ) and (self.deduplicate_contexts == "none" or history_is_too_short):
             # These favor the same token whenever the key and context recur.
             name = {

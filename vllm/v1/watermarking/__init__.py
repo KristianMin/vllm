@@ -3,6 +3,11 @@
 
 from vllm.config.watermarking import derive_watermark_key
 from vllm.v1.watermarking.binomial import BinomialScoreWatermarkDetector
+from vllm.v1.watermarking.block_verified_gumbel import (
+    BlockVerifiedGumbelDraftWatermarker,
+    BlockVerifiedGumbelVerificationWatermarker,
+    BlockVerifiedGumbelWatermarker,
+)
 from vllm.v1.watermarking.chi_squared import ChiSquaredWatermarker
 from vllm.v1.watermarking.concordmark import (
     ConcordMarkWatermarkDetector,
@@ -66,6 +71,8 @@ from vllm.v1.watermarking.textseal2 import (
     TextSeal2Watermarker,
 )
 from vllm.v1.watermarking.watermarker import (
+    SupportsDraftLaw,
+    SupportsDraftLawVerification,
     SupportsResidualVerification,
     SupportsSpeculativeDecoding,
     SupportsVerificationLogits,
@@ -77,6 +84,9 @@ __all__ = [
     "ConcordMarkWatermarkDetector",
     "ConcordMarkWatermarker",
     "BinomialScoreWatermarkDetector",
+    "BlockVerifiedGumbelDraftWatermarker",
+    "BlockVerifiedGumbelVerificationWatermarker",
+    "BlockVerifiedGumbelWatermarker",
     "ChiSquaredWatermarker",
     "DualKeyGumbelWatermarkDetector",
     "DualKeyGumbelWatermarker",
@@ -102,6 +112,8 @@ __all__ = [
     "RotationFirstWatermarker",
     "RedGreenWatermarkDetector",
     "RedGreenWatermarker",
+    "SupportsDraftLaw",
+    "SupportsDraftLawVerification",
     "SupportsResidualVerification",
     "SupportsSpeculativeDecoding",
     "SupportsVerificationLogits",

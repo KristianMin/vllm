@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from vllm.config.watermarking import WatermarkConfig
+from vllm.v1.watermarking.block_verified_gumbel import BlockVerifiedGumbelWatermarker
 from vllm.v1.watermarking.chi_squared import ChiSquaredWatermarker
 from vllm.v1.watermarking.concordmark import ConcordMarkWatermarker
 from vllm.v1.watermarking.gaussian_copula import (
@@ -51,6 +52,15 @@ def create_watermarker(
 ) -> Watermarker:
     if config.algorithm == "gumbel":
         return GumbelWatermarker(config.key, config.context_width, config.prf)
+    if config.algorithm == "block_verified_gumbel":
+        return BlockVerifiedGumbelWatermarker(
+            config.key,
+            config.context_width,
+            config.prf,
+            law=config.verification_law,
+            pass_aggregator=config.pass_aggregator,
+            pass_source=config.pass_source,
+        )
     if config.algorithm == "dual_key_gumbel":
         return DualKeyGumbelWatermarker(
             config.key,

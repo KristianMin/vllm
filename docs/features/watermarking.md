@@ -103,7 +103,8 @@ by `dspark`. With `draft_model`, a smaller model that shares the target's
 tokenizer drafts, and its tokens are watermarked like those of the other methods.
 
 Algorithms that verify unwatermarked drafts (the lookahead watermarks and
-textGrain) also accept `"draft_sample_method": "greedy"`. A lookahead row
+textGrain) also accept `"draft_sample_method": "greedy"`; `block_verified_gumbel`
+and `textseal2` race their drafts on the key and need probabilistic drafting. A lookahead row
 accepts a draft only when the draft is the row's race winner, so a draft is
 accepted with the target's probability of it. With probabilistic drafts the
 acceptance rate is Σ p·q, below the Σ min(p, q) of unwatermarked speculative
@@ -651,6 +652,35 @@ vllm serve MODEL \
 recursion on TextSeal2's noise instead, with `aggregator` and
 `aggregator_lambda` as for the other lookahead watermarks. Both rules read the
 clocks of rows they then discard, so `context_width` should be at least
+`num_speculative_tokens`.
+
+### Block-verified Gumbel-max
+
+`block_verified_gumbel` is Gumbel-max (`gumbel`'s key, PRF and contexts; without
+speculation it is `gumbel`) with TextSeal2's speculative rule on Gumbel-max's
+own clocks `E(v) = -log U(v)`: the drafter races every draft on the key,
+`d = argmin_v E(v) / q(v)`, on a draft law `q` truncated like the target
+(temperature, then the request's min-p, top-k and top-p), and verification runs
+one race on the leftovers `E - tau q` (`tau = E(d) / q(d)`) at the speeds of
+block verification's outcome law (`"verification_law": "token"` for
+token-level verification, `"shared"` for the shared-clock baseline that accepts
+a draft iff it is the target's own Gumbel-max token). The output keeps the
+model's distribution, the acceptance is block verification's, and every
+emitted token scores with `GumbelWatermarkDetector` as for `gumbel`.
+`pass_aggregator` (`identity`, `max`, `tsum`, `expsum`; `none` is the one-shot
+race) mixes each draft race's time into the race's backward chain without
+changing the output distribution or the acceptance. Repeated contexts race on
+fresh noise of the request seed, position and draft step. It needs
+probabilistic drafting:
+
+```bash
+vllm serve MODEL \
+  --speculative-config \
+  '{"method":"mtp","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}' \
+  --watermark-config '{"algorithm":"block_verified_gumbel","key":42,"pass_aggregator":"tsum"}'
+```
+
+As for the lookahead watermarks, `context_width` should be at least
 `num_speculative_tokens`.
 
 ## Pseudorandom functions

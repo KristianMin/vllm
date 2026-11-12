@@ -40,28 +40,32 @@ runs the race as a backward chain over depths, where position i stops iff its
 own race time ``M_i ~ Exp(P(I = i))`` beats the later positions' time
 ``S_{i+1} ~ Exp(P(I > i))``, and replaces that pass clock by
 ``psi(tau_i, S_{i+1} P(I > i)) / P(I > i)`` for an Exp(1)-preserving ``psi``
-increasing in both arguments. ``tau_i`` is independent of position i's
-leftovers and of the later positions, so the outcome keeps the law ``pi`` while
-kept drafts are those whose keyed draft race was fast. ``pass_source="child"``
-uses ``tau_{i+1}`` in position i's pass clock instead.
+increasing in both arguments, or ``identity`` (``tau_i`` alone). ``tau_i`` is
+independent of position i's leftovers and of the later positions, so the
+outcome keeps the law ``pi`` while kept drafts are those whose keyed draft race
+was fast. ``pass_source="child"`` uses ``tau_{i+1}`` in position i's pass clock
+instead.
 """
 
 import numpy as np
 import torch
 
 LAWS = ("block", "token")
-PASS_AGGREGATORS = ("none", "tsum", "expsum", "max")
+PASS_AGGREGATORS = ("none", "identity", "tsum", "expsum", "max")
 PASS_SOURCES = ("own", "child")
 
 
 def pass_aggregate(a: torch.Tensor, b: torch.Tensor, name: str) -> torch.Tensor:
     """``psi(a, b)``, Exp(1) for independent Exp(1) ``a`` and ``b`` and
-    increasing in both; infinite when either is. ``max``: ``2 min(a, b)``;
+    increasing in both; infinite when either is. ``identity``: ``a`` (the
+    draft keeps its own clock); ``max``: ``2 min(a, b)``;
     ``expsum``: ``s - log(1 + s)`` for ``s = a + b``, whose survival function is
     uniform; ``tsum``: ``exp(-T(-log a - log b))`` with lookahead Gumbel-max's
     table ``T``. In Gumbel units these are lookahead Gumbel-max's ``max``,
     ``expsum`` and ``tsum`` aggregators."""
     a, b = a.double(), b.double()
+    if name == "identity":
+        return a
     infinite = torch.isinf(a) | torch.isinf(b)
     a = torch.where(infinite, 1.0, a)
     b = torch.where(infinite, 1.0, b)
