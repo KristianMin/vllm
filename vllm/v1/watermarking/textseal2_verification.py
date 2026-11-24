@@ -51,8 +51,20 @@ import numpy as np
 import torch
 
 LAWS = ("block", "token")
+# Point-mass verification's law (``point_law``): block_verified_gumbel's
+# residual race only, not a TextSeal2 rule.
+POINT_LAW = "point"
+RESIDUAL_LAWS = LAWS + (POINT_LAW,)
 PASS_AGGREGATORS = ("none", "identity", "tsum", "expsum", "max")
 PASS_SOURCES = ("own", "child")
+# Which time of row i enters its pass clock: ``draft``, the draft race's time
+# ``tau_i = E_i(d_i) / q_i(d_i)`` (keyed drafts raced on the clocks); ``raw``,
+# the drafted token's raw clock ``E_i(d_i)`` (drafts that do not depend on the
+# key: given them, the clocks are an i.i.d. Exp(1) field, so ``E_i(d_i)`` is
+# independent of row i's other clocks and of the later rows). With ``raw`` and
+# ``use_leftovers=False`` the chain is lookahead Gumbel-max's recursion with the
+# rows' weights replaced by the verification law.
+PASS_TIMES = ("draft", "raw")
 
 
 def pass_aggregate(a: torch.Tensor, b: torch.Tensor, name: str) -> torch.Tensor:
@@ -186,6 +198,32 @@ def token_law(
     return _zero_draft_slots(pi, dpos, K), stop
 
 
+def point_law(
+    P: torch.Tensor, Q: torch.Tensor, dpos: torch.Tensor, K: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Point-mass verification's outcome law given the drafts, as
+    ``block_law``: every row compares its draft with an independent pick of the
+    target, so row i keeps ``d_i`` with probability ``p_i(d_i)`` and stops with
+    ``v != d_i`` with probability ``p_i(v)``: ``pi_i(v) = reach_i p_i(v)``,
+    ``pi_bonus = reach_K p_bonus``, ``reach_i = prod_{j < i} p_j(d_j)``. ``Q``
+    is not read (``token_law`` with ``q_i`` the point mass at ``d_i``)."""
+    B, D, C = P.shape
+    reach = torch.ones(B, dtype=P.dtype, device=P.device)
+    pi = torch.zeros_like(P)
+    stop = torch.zeros(B, D, dtype=P.dtype, device=P.device)
+    for i in range(D):
+        is_draft = i < K
+        is_bonus = i == K
+        p, pos = P[:, i], dpos[:, i].clamp(0, C - 1)
+        pd = _gather(p, pos).clamp(0.0, 1.0)
+        s = torch.where(is_draft, reach * (1.0 - pd), torch.where(is_bonus, reach, 0.0))
+        stop[:, i] = s
+        live = (is_draft | is_bonus).unsqueeze(1)
+        pi[:, i] = torch.where(live, reach.unsqueeze(1) * p, 0.0)
+        reach = torch.where(is_draft, reach * pd, reach)
+    return _zero_draft_slots(pi, dpos, K), stop
+
+
 def outcome_law(
     P: torch.Tensor,
     Q: torch.Tensor,
@@ -197,7 +235,9 @@ def outcome_law(
         return block_law(P, Q, dpos, K)
     if law == "token":
         return token_law(P, Q, dpos, K)
-    raise ValueError(f"law must be one of {LAWS}")
+    if law == POINT_LAW:
+        return point_law(P, Q, dpos, K)
+    raise ValueError(f"law must be one of {RESIDUAL_LAWS}")
 
 
 def race(E: torch.Tensor, law: torch.Tensor) -> torch.Tensor:
@@ -228,18 +268,33 @@ def residual_race(
     law: str = "block",
     pass_aggregator: str = "none",
     pass_source: str = "own",
+    use_leftovers: bool = True,
+    pass_time: str = "draft",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """TextSeal2's decision for a batch of requests: the stopping depth ``I``
-    [B] and the candidate emitted there [B]."""
+    [B] and the candidate emitted there [B]. ``use_leftovers=False`` races the
+    raw clocks ``E`` instead of the leftovers, and ``pass_time="raw"`` feeds
+    the drafted token's raw clock into the pass clock (``PASS_TIMES``): both
+    for drafts that do not depend on the key."""
     if pass_aggregator not in PASS_AGGREGATORS:
         raise ValueError(f"pass_aggregator must be one of {PASS_AGGREGATORS}")
     if pass_source not in PASS_SOURCES:
         raise ValueError(f"pass_source must be one of {PASS_SOURCES}")
+    if pass_time not in PASS_TIMES:
+        raise ValueError(f"pass_time must be one of {PASS_TIMES}")
     pi, stop = outcome_law(P, Q, dpos, K, law)
-    tau = draft_times(E, Q, dpos, K)
-    # Leftovers E - tau q, at least 0 when the draft won its race.
-    lanes = (E - tau.unsqueeze(2) * Q).clamp_min(0.0)
     B, D, C = E.shape
+    if pass_time == "raw":
+        is_draft_row = torch.arange(D, device=E.device).unsqueeze(0) < K.unsqueeze(1)
+        raw = E.gather(2, dpos.clamp(0, C - 1).unsqueeze(2)).squeeze(2)
+        tau = torch.where(is_draft_row, raw, 0.0)
+    else:
+        tau = draft_times(E, Q, dpos, K)
+    if use_leftovers:
+        # Leftovers E - tau q, at least 0 when the draft won its race.
+        lanes = (E - draft_times(E, Q, dpos, K).unsqueeze(2) * Q).clamp_min(0.0)
+    else:
+        lanes = E
     ratio = torch.where(pi > 0, lanes / torch.where(pi > 0, pi, 1.0), torch.inf)
     if pass_aggregator == "none":
         flat = ratio.reshape(B, D * C).argmin(dim=1)
