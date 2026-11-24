@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Lookahead verification of the dual-key (TextSeal) and Gaussian copula
-Gumbel-max watermarks."""
+"""Lookahead verification of the dual-key (TextSeal), Gaussian copula and
+TextSeal2 Gumbel-max watermarks."""
 
 import math
 
@@ -16,8 +16,10 @@ from vllm.v1.watermarking import (
     LookaheadDualKeyGumbelWatermarker,
     LookaheadGaussianCopulaWatermarker,
     LookaheadGumbelWatermarker,
+    LookaheadTextSeal2Watermarker,
     SupportsSpeculativeDecoding,
     SupportsVerificationLogits,
+    TextSeal2Watermarker,
     create_watermarker,
 )
 from vllm.v1.watermarking.spec_decode import (
@@ -28,6 +30,7 @@ from vllm.v1.watermarking.spec_decode import (
 VARIANTS = {
     "lookahead_dual_key_gumbel": LookaheadDualKeyGumbelWatermarker,
     "lookahead_gaussian_copula": LookaheadGaussianCopulaWatermarker,
+    "lookahead_textseal2": LookaheadTextSeal2Watermarker,
 }
 
 
@@ -187,6 +190,12 @@ def _detection_scores(
         uniforms = prf.uniform(contexts, tokens.unsqueeze(-1)).squeeze(-1)
         return -torch.log1p(-uniforms.double())
 
+    if isinstance(watermarker, LookaheadTextSeal2Watermarker):
+        # TextSeal2's private score -log Phi(-G*) on the virtual key.
+        virtual = watermarker.sampling_watermarker.virtual_key(
+            contexts, tokens.unsqueeze(-1)
+        ).squeeze(-1)
+        return -torch.special.log_ndtr(-virtual)
     if isinstance(watermarker, LookaheadDualKeyGumbelWatermarker):
         alpha = watermarker.alpha
         return (1 - alpha) * score(watermarker.prf) + alpha * score(
@@ -225,11 +234,41 @@ def test_lookahead_raises_the_emitted_score_at_equal_acceptance(algorithm: str):
     assert results["tsum"][0] > 1.05 * results["pi1"][0], results
 
 
-def test_copula_verifies_partial_contexts_without_the_watermark():
+def test_textseal2_samples_like_textseal2_without_speculation():
+    rows = _blocks(32, 1, 97, 3, seed=3)
+    expected = TextSeal2Watermarker(key=9, context_width=3)._sample_watermarked(
+        rows["logits"], rows["contexts"]
+    )
+    output = LookaheadTextSeal2Watermarker(key=9, context_width=3)._sample_watermarked(
+        rows["logits"], rows["contexts"]
+    )
+
+    assert torch.equal(output.token_ids, expected.token_ids)
+
+
+def test_textseal2_races_on_the_virtual_key():
+    """At correlation 1 the race Gumbels are those of the virtual key Phi(G*),
+    for both keys: changing either key changes them."""
+    contexts = _blocks(8, 3, 61, 2, seed=8)["contexts"]
+    watermarker = LookaheadTextSeal2Watermarker(key=5, context_width=2, correlation=1.0)
+    virtual = watermarker.sampling_watermarker.virtual_key(contexts, torch.arange(61))
+
+    gumbels = watermarker.race_gumbels(contexts, 61)
+
+    expected = -torch.log(-torch.special.log_ndtr(virtual))
+    assert torch.allclose(gumbels.double(), expected, atol=1e-5)
+    key_a = -torch.log(-torch.log(watermarker.prf.uniform(contexts, torch.arange(61))))
+    assert not torch.allclose(gumbels, key_a, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "cls", [LookaheadGaussianCopulaWatermarker, LookaheadTextSeal2Watermarker]
+)
+def test_copula_verifies_partial_contexts_without_the_watermark(cls):
     rows = _blocks(16, 4, 61, 2, seed=7)
     rows["skip_mask"][:] = False
     rows["contexts"][0, 0] = -1
-    watermarker = LookaheadGaussianCopulaWatermarker(key=5, context_width=2)
+    watermarker = cls(key=5, context_width=2)
 
     output = watermarker.verification_logits(**rows)
 

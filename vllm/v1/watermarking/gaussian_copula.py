@@ -6,13 +6,13 @@
 https://arxiv.org/abs/2609.37310."""
 
 import math
+from typing import Any
 
 import torch
 
 from vllm.config.watermarking import WatermarkPRFName
 from vllm.v1.watermarking.gumbel import (
-    GumbelWatermarkDetector,
-    _gamma_survival_integer_shape,
+    WeightedGumbelWatermarkDetector,
     _validate_context_width,
 )
 from vllm.v1.watermarking.prfs import PhiloxPRF, WatermarkPRF, create_prf
@@ -25,6 +25,8 @@ from vllm.v1.watermarking.watermarker import (
 # AutoMark's coupling for its copula, chosen to match the quality of TextSeal
 # at alpha 0.1.
 DEFAULT_CORRELATION = 0.98551
+# Only the most likely tokens receive keyed noise; the tail is sampled privately.
+NUM_CANDIDATES = 4096
 # Seeds the fresh noise off CUDA. Public: the noise needs no secrecy.
 _FRESH_NOISE_SEED = 0x434F50554C4131
 
@@ -52,6 +54,10 @@ class GaussianCopulaWatermarker(Watermarker):
     favors tokens with a high ``U_u``. The context is the last
     ``context_width`` tokens; rows whose context reaches before the output are
     sampled without the watermark.
+
+    Keyed noise is limited to the ``NUM_CANDIDATES`` most likely tokens.
+    An independent plain sample chooses the head or tail, preserving their
+    probability masses and the original tail distribution.
 
     Unlike the reference, the PRF is vLLM's Philox, the fresh noise is the
     request's sampling noise on CUDA (elsewhere it comes from a seeded
@@ -122,7 +128,14 @@ class GaussianCopulaWatermarker(Watermarker):
         logits: torch.Tensor,
         contexts: torch.Tensor,
     ) -> WatermarkSample:
-        vocabulary = torch.arange(logits.shape[-1], device=logits.device)
+        capped = logits.shape[-1] > NUM_CANDIDATES
+        if capped:
+            candidate_logits, vocabulary = logits.topk(
+                NUM_CANDIDATES, dim=-1, sorted=False
+            )
+        else:
+            candidate_logits = logits
+            vocabulary = torch.arange(logits.shape[-1], device=logits.device)
         u = self.prf.uniform(contexts, vocabulary).double()
         generator = self._generators.get(logits.device)
         if generator is None:
@@ -132,16 +145,28 @@ class GaussianCopulaWatermarker(Watermarker):
         noise = torch.randn(
             u.shape, dtype=torch.float64, device=logits.device, generator=generator
         )
-        noised = logits.double() + gumbels(u, noise, self.correlation)
-        return WatermarkSample(torch.argmax(noised, dim=-1), logits)
+        noised = candidate_logits.double() + gumbels(u, noise, self.correlation)
+        token_ids = torch.argmax(noised, dim=-1)
+        if capped:
+            token_ids = vocabulary.gather(-1, token_ids.unsqueeze(-1))[:, 0]
+            # An independent plain draw chooses the head or its original tail.
+            plain = torch.multinomial(
+                logits.float().softmax(-1), 1, generator=generator
+            )
+            in_head = (vocabulary == plain).any(dim=-1)
+            token_ids = torch.where(in_head, token_ids, plain[:, 0])
+        return WatermarkSample(token_ids, logits)
 
 
-class GaussianCopulaWatermarkDetector(GumbelWatermarkDetector):
+class GaussianCopulaWatermarkDetector(WeightedGumbelWatermarkDetector):
     """Detect a Gaussian copula watermark.
 
     Every distinct (context, token) pair with a full context scores
     ``-log(1 - U)``, which is Exp(1) without the watermark; the p-value is the
-    Gamma tail of the summed score, multiplied by ``key_safety`` and capped at 1.
+    Gamma tail of the summed score, assuming ideal independent PRF uniforms.
+
+    The weighted tests of ``WeightedGumbelWatermarkDetector`` apply, over
+    these positions.
     """
 
     def __init__(
@@ -150,36 +175,46 @@ class GaussianCopulaWatermarkDetector(GumbelWatermarkDetector):
         context_width: int = 4,
         p_value_threshold: float = 0.01,
         prf: WatermarkPRF | WatermarkPRFName = "philox",
-        key_safety: float = 20.0,
+        tokenizer: Any = None,
+        word_start_weight: float = 1.0,
     ) -> None:
-        if key_safety < 1:
-            raise ValueError("key_safety must be at least 1")
         super().__init__(
-            key, context_width, p_value_threshold, prf, deduplicate_contexts=False
+            key,
+            context_width,
+            p_value_threshold,
+            prf,
+            deduplicate_contexts=False,
+            tokenizer=tokenizer,
+            word_start_weight=word_start_weight,
         )
-        self.key_safety = key_safety
 
-    def _prepare_inputs(
-        self, token_ids: list[int]
+    def _scored_positions(self, token_ids: list[int]) -> list[int]:
+        """Positions of the first occurrence of each (context, token) pair
+        with a full context (the Gumbel detector's rule is per context)."""
+        width = self.context_width
+        first: dict[tuple[tuple[int, ...], int], int] = {}
+        for stop in range(width, len(token_ids)):
+            pair = (tuple(token_ids[stop - width : stop]), token_ids[stop])
+            first.setdefault(pair, stop)
+        return list(first.values())
+
+    def _pairs(
+        self, token_ids: list[int], positions: list[int]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         width = self.context_width
-        pairs = dict.fromkeys(
-            (tuple(token_ids[stop - width : stop]), token_ids[stop])
-            for stop in range(width, len(token_ids))
-        )
-        if not pairs:
+        if not positions:
             return (
                 torch.empty((0, width), dtype=torch.int64),
                 torch.empty(0, dtype=torch.int64),
             )
-        contexts, targets = zip(*pairs)
         return (
-            torch.tensor(contexts, dtype=torch.int64),
-            torch.tensor(targets, dtype=torch.int64),
+            torch.tensor(
+                [token_ids[p - width : p] for p in positions], dtype=torch.int64
+            ),
+            torch.tensor([token_ids[p] for p in positions], dtype=torch.int64),
         )
 
-    def _get_p_value(self, score: float, num_scored_tokens: int) -> float:
-        return min(
-            1.0,
-            self.key_safety * _gamma_survival_integer_shape(score, num_scored_tokens),
-        )
+    def _prepare_inputs(
+        self, token_ids: list[int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._pairs(token_ids, self._scored_positions(token_ids))

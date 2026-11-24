@@ -17,6 +17,11 @@ from vllm.v1.watermarking.detector import WatermarkDetection
 from vllm.v1.watermarking.gumbel import GumbelWatermarkDetector, GumbelWatermarker
 from vllm.v1.watermarking.prfs import WatermarkPRF
 from vllm.v1.watermarking.prfs.base import _UINT32_MASK
+from vllm.v1.watermarking.weighting import (
+    _WEIGHT_LEVELS,
+    _gamma_tail,
+    _weighted_tail,
+)
 
 # Uses of a window before the ladder widens it.
 _TALLY_TIER = 4
@@ -24,8 +29,6 @@ _TALLY_TIER = 4
 # start on the two-token rung.
 _COMMON_FLOOR = 200
 _NUM_VOICES = 6
-# High-mode weights 1 + min(surprisal, 2.5), quantised to steps of 0.25.
-_WEIGHT_LEVELS = 1.0 + 0.25 * torch.arange(11, dtype=torch.float64)
 # Covers the residual error of the saddlepoint tail.
 _TAIL_SAFETY = 1.02
 
@@ -124,48 +127,6 @@ def _sidak(p_value: float) -> float:
     if p_value >= 1.0:
         return 1.0
     return -math.expm1(_NUM_VOICES * math.log1p(-p_value))
-
-
-def _gamma_tail(shape: torch.Tensor | float, value: float) -> torch.Tensor:
-    shape = torch.as_tensor(shape, dtype=torch.float64)
-    return torch.special.gammaincc(shape, torch.tensor(value, dtype=torch.float64))
-
-
-def _weighted_tail(total: float, hist: torch.Tensor) -> float:
-    """`P[sum_j w_j E_j >= total]` for i.i.d. `E_j ~ Exp(1)` and `hist[l]`
-    weights `_WEIGHT_LEVELS[l]`: exact for one weight, else Lugannani-Rice."""
-    terms = [(w, c) for w, c in zip(_WEIGHT_LEVELS.tolist(), hist.tolist()) if c]
-    if total <= 0 or not terms:
-        return 1.0
-    if len(terms) == 1:
-        return _gamma_tail(terms[0][1], total / terms[0][0]).item()
-
-    mean = sum(w * c for w, c in terms)
-    # Bisect K'(theta) = total; K' increases up to its pole at 1 / max(w).
-    if total >= mean:
-        lower = 0.0
-        upper = min(
-            min((1 - c * w / total) / w for w, c in terms), 1 / max(w for w, _ in terms)
-        )
-    else:
-        lower, upper = (1 - mean / total) / min(w for w, _ in terms), 0.0
-    for _ in range(64):
-        theta = (lower + upper) / 2
-        if sum(c * w / (1 - w * theta) for w, c in terms) < total:
-            lower = theta
-        else:
-            upper = theta
-    theta = (lower + upper) / 2
-
-    cgf = -sum(c * math.log(1 - w * theta) for w, c in terms)
-    curve = sum(c * (w / (1 - w * theta)) ** 2 for w, c in terms)
-    w_hat = math.copysign(math.sqrt(max(2 * (theta * total - cgf), 0.0)), theta)
-    u_hat = theta * math.sqrt(curve)
-    if abs(w_hat) < 1e-6 or u_hat == 0:
-        return 0.5  # The removable singularity at total = E[T].
-    density = math.exp(-w_hat * w_hat / 2) / math.sqrt(2 * math.pi)
-    tail = math.erfc(w_hat / math.sqrt(2)) / 2 + density * (1 / u_hat - 1 / w_hat)
-    return min(max(tail, 0.0), 1.0) if math.isfinite(tail) else 0.5
 
 
 class ConcordMarkWatermarkDetector(GumbelWatermarkDetector):

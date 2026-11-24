@@ -486,12 +486,22 @@ class DraftModelSpeculator(BaseSpeculator):
     ) -> None:
         if self.draft_watermarker is None:
             return
+        truncation: dict[str, torch.Tensor] = {}
+        if self.draft_watermarker.uses_draft_law:
+            # The draft law follows the requests' truncation.
+            states = sampler.sampling_states
+            truncation = {
+                "top_k": states.top_k.gpu[idx_mapping],
+                "top_p": states.top_p.gpu[idx_mapping],
+                "min_p": states.min_p.gpu[idx_mapping],
+            }
         self.draft_watermarker.prepare(
             sampler._get_contexts(idx_mapping),
             sampler.watermarking.gpu[idx_mapping],
             sampler.req_states.all_token_ids.gpu,
             sampler.req_states.prompt_len.gpu,
             sampler.req_states.total_len.gpu,
+            **truncation,
         )
 
     def _copy_request_inputs(

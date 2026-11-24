@@ -904,13 +904,14 @@ class SamplingParams(
         speculative_config: SpeculativeConfig | None,
         structured_outputs_config: StructuredOutputsConfig | None,
         tokenizer: TokenizerLike | None,
+        use_v2_model_runner: bool = False,
     ) -> None:
         self._validate_logprobs(model_config)
         self._validate_logit_bias(model_config)
         self._validate_trace_replay(model_config, speculative_config)
         self._validate_stop_token_ids(model_config)
         self._validate_allowed_token_ids(model_config)
-        self._validate_spec_decode(speculative_config)
+        self._validate_spec_decode(speculative_config, use_v2_model_runner)
         self._validate_diffusion(model_config)
         self._validate_structured_outputs(
             model_config, structured_outputs_config, tokenizer
@@ -1182,15 +1183,24 @@ class SamplingParams(
     def _validate_spec_decode(
         self,
         speculative_config: SpeculativeConfig | None,
+        use_v2_model_runner: bool = False,
     ) -> None:
         if speculative_config is None:
             return
 
         # Some sampling parameters are not yet compatible with spec decoding.
-        if self.min_p > _SAMPLING_EPS or self.logit_bias:
+        if self.logit_bias:
             raise VLLMValidationError(
-                "The min_p and logit_bias sampling parameters "
-                "are not yet supported with speculative decoding."
+                "The logit_bias sampling parameter "
+                "is not yet supported with speculative decoding."
+            )
+        # Model Runner V2 applies min_p to every row of the target logits that
+        # drafts are verified against (and that watermarks race on), so
+        # rejection sampling still returns the min_p distribution.
+        if self.min_p > _SAMPLING_EPS and not use_v2_model_runner:
+            raise VLLMValidationError(
+                "The min_p sampling parameter is not yet supported with "
+                "speculative decoding in Model Runner V1."
             )
 
     def _validate_diffusion(self, model_config: ModelConfig) -> None:

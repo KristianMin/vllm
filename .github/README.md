@@ -93,7 +93,7 @@ All detectors are in `vllm.v1.watermarking`.
 - `gumbel`, `red_green` and `unigram` need `"allow_target_only_watermarking": true`, which leaves draft tokens unwatermarked. For `gumbel`, that weakens the watermark in proportion to the share of accepted drafts. `red_green` and `unigram` verify drafts against their watermarked logits, so they keep their full strength at a lower acceptance rate.
 - `multibit_red_green`, `chi_squared`, `ppl_hard`, `ppl_soft`, `synthid` and `gaussian_copula` don't support it.
 
-The drafter must be an autoregressive model (`dspark`, `eagle`, `eagle3` or `mtp`) with `"draft_sample_method": "probabilistic"`. The [guide](https://github.com/KristianMin/vllm/blob/watermark-all/docs/features/watermarking.md#speculative-decoding) has the details.
+The drafter must be an autoregressive model (`dspark`, `draft_model`, `eagle`, `eagle3` or `mtp`) with `"draft_sample_method": "probabilistic"`. The [guide](https://github.com/KristianMin/vllm/blob/watermark-all/docs/features/watermarking.md#speculative-decoding) has the details.
 
 ## Before you rely on it
 
