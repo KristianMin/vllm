@@ -46,7 +46,10 @@ LOOKAHEAD_GUMBEL_PATH_AGGREGATORS = ("optpath",)
 LOOKAHEAD_PPL_AGGREGATORS = ("pi1", "pi2", "tsum", "max", "gauss", "optpath")
 WatermarkPRFName = Literal["philox"]
 RotationFirstLexicalLetters = Literal["latin", "latin_cyrillic"]
-WatermarkContextScope = Literal["none", "single_turn", "all"]
+WatermarkContextScope = Literal["none", "single_turn", "all", "strict"]
+# Algorithms whose speculative verification implements deduplicate_contexts
+# "strict" (contexts evaluated in earlier verification steps are repeated too).
+STRICT_DEDUPLICATION_ALGORITHMS = ("lookahead_gumbel", "block_verified_gumbel")
 
 _MIN_RECOMMENDED_DEDUP_HISTORY = 1024
 
@@ -106,14 +109,37 @@ class WatermarkConfig:
     the leftovers of the drafts' clocks, which keeps block verification's
     acceptance and watermarks every emitted token. False leaves the drafts
     unwatermarked and runs the residual race on them as point masses, which
-    accepts each draft with its target probability."""
-    verification_law: Literal["block", "token", "shared"] = "block"
+    accepts each draft with its target probability. For
+    `block_verified_gumbel`, false samples the drafts from the draft law with
+    fresh noise that does not depend on the key, and verification runs
+    lookahead Gumbel-max's recursion on the raw keyed clocks with the
+    verification law as the rows' weights (no residual race): the acceptance of
+    unwatermarked verification with the same draft law."""
+    verification_law: Literal["block", "token", "shared", "point"] = "block"
     """Verification law the residual race of `textseal2` and
     `block_verified_gumbel` follows under speculative decoding: `block`
     verification (the TextSeal2 paper's rule) or `token`-level verification,
     which accepts fewer drafts. `shared` (`block_verified_gumbel` only) is the
     baseline that verifies the keyed drafts on the shared clocks: every row
-    emits its own Gumbel-max token and a draft is kept iff it equals it."""
+    emits its own Gumbel-max token and a draft is kept iff it equals it.
+    `point` (`block_verified_gumbel` only) is point-mass verification's law:
+    a draft is kept with its target probability, otherwise the row emits
+    another token with its target probability."""
+    residual_race: bool = True
+    """Whether `block_verified_gumbel` decides each round of its keyed drafts
+    by the residual race. False is plain block (or token-level) verification
+    of the keyed drafts: the stopping row is drawn with fresh randomness that
+    does not depend on the key, the token after the kept drafts is the bonus
+    row's Gumbel-max sample with the key when every draft is kept, else a
+    Gumbel-max sample of the verification law's residual distribution with a
+    second key; detect with `FusedTwoKeyGumbelWatermarkDetector`. Requires
+    `pass_aggregator="none"` and keyed drafts."""
+    fresh_lanes: bool = False
+    """`block_verified_gumbel` with `keyed_drafts=false` only: verify on fresh
+    clocks that do not depend on the key, so nothing is watermarked. The
+    unwatermarked baseline of the sampled-draft rule: speculative decoding with
+    drafts sampled from the draft law and the verification law of
+    `verification_law`. Requires `pass_aggregator="none"`."""
     pass_aggregator: Literal["none", "identity", "tsum", "expsum", "max"] = "none"
     """The lookahead on the residual race of `textseal2` and
     `block_verified_gumbel` under speculative decoding (not in the TextSeal2
@@ -164,7 +190,12 @@ class WatermarkConfig:
     sampled; a repeated context is sampled without the watermark. `none`
     disables the search. `single_turn` (default) searches this request's
     generated tokens. `all` also searches the prompt and samples the first
-    `context_width` generated tokens without watermarking. Always `none` for
+    `context_width` generated tokens without watermarking. `strict`
+    (`lookahead_gumbel` and `block_verified_gumbel` only) searches like
+    `single_turn` and also treats as repeated every context of a row an
+    earlier speculative verification step of the request evaluated (rejected
+    rows and rows after the first rejection included), whose keyed values a
+    lookahead or residual race has already read. Always `none` for
     `rotation_first`. Ignored by `concordmark`, which builds its own contexts."""
     deduplicate_contexts_max_history: int | None = Field(default=8192, ge=1)
     """Number of most recent history positions searched (default 8192), or
@@ -211,6 +242,43 @@ class WatermarkConfig:
             "textgrain",
         )
 
+    def _validate_block_verified_gumbel(self) -> None:
+        """The combinations of `block_verified_gumbel`'s speculative rule."""
+        bvg = self.algorithm == "block_verified_gumbel"
+        if self.verification_law == "point" and not bvg:
+            raise ValueError(
+                "verification_law='point' is only defined for block_verified_gumbel"
+            )
+        if not self.residual_race:
+            if not bvg:
+                raise ValueError(
+                    "residual_race=false is only defined for block_verified_gumbel"
+                )
+            if not self.keyed_drafts or self.verification_law not in (
+                "block",
+                "token",
+            ):
+                raise ValueError(
+                    "residual_race=false verifies keyed drafts by block or "
+                    "token-level verification"
+                )
+            if self.pass_aggregator != "none":
+                raise ValueError(
+                    "residual_race=false has no pass_aggregator (no residual race)"
+                )
+        if self.fresh_lanes:
+            if not bvg or self.keyed_drafts:
+                raise ValueError(
+                    "fresh_lanes is the unwatermarked baseline of "
+                    "block_verified_gumbel with keyed_drafts=false"
+                )
+            if self.pass_aggregator != "none":
+                raise ValueError("fresh_lanes requires pass_aggregator='none'")
+        if bvg and not self.keyed_drafts and self.verification_law == "shared":
+            raise ValueError(
+                "verification_law='shared' verifies keyed drafts (keyed_drafts=true)"
+            )
+
     @model_validator(mode="after")
     def validate_watermark_settings(self) -> Self:
         if self.key > 2**64 - 1:
@@ -253,6 +321,15 @@ class WatermarkConfig:
         ):
             raise ValueError(
                 "verification_law='shared' is only defined for block_verified_gumbel"
+            )
+        self._validate_block_verified_gumbel()
+        if (
+            self.deduplicate_contexts == "strict"
+            and self.algorithm not in STRICT_DEDUPLICATION_ALGORITHMS
+        ):
+            raise ValueError(
+                "deduplicate_contexts='strict' is only implemented for "
+                f"{STRICT_DEDUPLICATION_ALGORITHMS}"
             )
         if self.algorithm == "rotation_first":
             self.deduplicate_contexts = "none"

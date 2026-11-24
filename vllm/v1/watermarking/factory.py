@@ -60,6 +60,10 @@ def create_watermarker(
             law=config.verification_law,
             pass_aggregator=config.pass_aggregator,
             pass_source=config.pass_source,
+            keyed_drafts=config.keyed_drafts,
+            fresh_lanes=config.fresh_lanes,
+            residual_race=config.residual_race,
+            fresh_draft_noise=config.deduplicate_contexts == "strict",
         )
     if config.algorithm == "dual_key_gumbel":
         return DualKeyGumbelWatermarker(

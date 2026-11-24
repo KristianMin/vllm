@@ -147,6 +147,10 @@ context:
 - `"none"` disables context deduplication.
 - `"single_turn"`, the default, searches the tokens generated for the current
   request. This gives single-turn non-distortion.
+- `"strict"` (`lookahead_gumbel` and `block_verified_gumbel` only) searches
+  like `"single_turn"` and also counts as repeated every context an earlier
+  speculative verification step of the request evaluated, including rows past
+  the first rejection (see [Block-verified Gumbel-max](#block-verified-gumbel-max)).
 - `"all"` also searches the prompt, which extends non-distortion across the
   turns of a conversation. The first `context_width` generated tokens use
   ordinary sampling, and subsequent tokens whose context already occurs in the
@@ -682,6 +686,34 @@ vllm serve MODEL \
 
 As for the lookahead watermarks, `context_width` should be at least
 `num_speculative_tokens`.
+
+The same algorithm runs the other members of the speculative family (the codes
+are `<draft><verification>.<aggregator>`: drafts greedy `g`, sampled `s` or
+keyed `k`; verification point-mass `p`, token-level `t` or block `b`):
+
+| Code | Configuration (besides the key) | Rule |
+|---|---|---|
+| `kb.*`, `kt.*` | `"verification_law": "block"` / `"token"` | keyed drafts, residual race on the leftovers |
+| `kpr.*` | `"verification_law": "point"` | the same at point-mass verification's law: a draft is kept with its target probability |
+| `kp.pi1` | `"verification_law": "shared"` | keyed drafts, a draft kept iff it is the target's own Gumbel-max token |
+| `kb.plain` | `"residual_race": false` | keyed drafts, plain block verification: the stopping row from fresh randomness, the bonus token with the key, the token after a rejection with a second key |
+| `sb.*`, `st.*`, `sp.*` | `"keyed_drafts": false` and the law | drafts sampled from the draft law with fresh noise; lookahead Gumbel-max's recursion on the raw keyed clocks with the verification law as the rows' weights |
+| `nowm.sb`, `nowm.st`, `nowm.sp` | `"keyed_drafts": false, "fresh_lanes": true` and the law | the unwatermarked baselines: sampled drafts verified on fresh clocks |
+| `gp.*` | `lookahead_gumbel` with greedy drafts | lookahead Gumbel-max |
+
+`pass_aggregator` is the aggregator (`identity` = `pi1`, `none` = `pi2`,
+`tsum`, `max`, `expsum`); every member keeps the model's distribution and has
+the acceptance of its verification law, the same for every aggregator.
+`kb.plain` is detected by `FusedTwoKeyGumbelWatermarkDetector` (the score
+`a s_A + (1 - a) s_B` of both keys with the exact p-value of the sum), whose
+weight `a` is the run's share of key-A tokens; the verifier counts them, and
+with `VLLM_BV_GUMBEL_KEY_LOG=<path>` writes the running counts to that file.
+With `"deduplicate_contexts": "strict"` (`lookahead_gumbel` and
+`block_verified_gumbel`), a context that any row of an earlier verification step
+of the request evaluated counts as repeated too: the lookahead and residual
+races read the keyed clocks of rows past the first rejection, and `strict`
+keeps them from being raced on again, so the output stays exact (with
+`single_turn`, only the row-wise rules `pi1` and `shared` are).
 
 ## Pseudorandom functions
 

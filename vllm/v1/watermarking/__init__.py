@@ -7,6 +7,9 @@ from vllm.v1.watermarking.block_verified_gumbel import (
     BlockVerifiedGumbelDraftWatermarker,
     BlockVerifiedGumbelVerificationWatermarker,
     BlockVerifiedGumbelWatermarker,
+    FusedTwoKeyGumbelWatermarkDetector,
+    FusedWatermarkDetection,
+    SampledDraftWatermarker,
 )
 from vllm.v1.watermarking.chi_squared import ChiSquaredWatermarker
 from vllm.v1.watermarking.concordmark import (
@@ -89,6 +92,8 @@ __all__ = [
     "BlockVerifiedGumbelWatermarker",
     "ChiSquaredWatermarker",
     "DualKeyGumbelWatermarkDetector",
+    "FusedTwoKeyGumbelWatermarkDetector",
+    "FusedWatermarkDetection",
     "DualKeyGumbelWatermarker",
     "GaussianCopulaWatermarkDetector",
     "GaussianCopulaWatermarker",
@@ -112,6 +117,7 @@ __all__ = [
     "RotationFirstWatermarker",
     "RedGreenWatermarkDetector",
     "RedGreenWatermarker",
+    "SampledDraftWatermarker",
     "SupportsDraftLaw",
     "SupportsDraftLawVerification",
     "SupportsResidualVerification",
