@@ -672,10 +672,11 @@ def test_cuda_evaluated_contexts_match_cpu():
     generator = torch.Generator().manual_seed(7)
     ctx = torch.randint(-1, 10**6, (5000, 4), generator=generator)
     assert torch.equal(context_hashes(ctx), context_hashes(ctx.cuda()).cpu())
+    # Requests' rows are contiguous with local positions 0, 1, ... (commit's contract).
+    req = torch.randint(-1, 8, (40,), generator=torch.Generator().manual_seed(1)).sort().values
+    local = torch.tensor([int((req[:i] == req[i]).sum()) for i in range(40)])
     for device in ("cpu", "cuda"):
         store = EvaluatedContexts(8, 64, torch.device(device))
-        req = torch.randint(-1, 8, (40,), generator=torch.Generator().manual_seed(1))
-        local = torch.zeros(40, dtype=torch.long)
         store.commit(ctx[:40].to(device), req.to(device), local.to(device), torch.ones(40, dtype=torch.bool, device=device))
         found = store.contains(ctx[:40].to(device), req.to(device)).cpu()
         assert found.tolist() == (req >= 0).tolist()
@@ -700,6 +701,10 @@ def test_cuda_rule_matches_cpu(arm):
     drafts = torch.multinomial(torch.softmax(law, -1), 1, generator=generator)[:, 0]
     contexts = torch.randint(0, 10**6, (rows, width), generator=generator)
     repeated = torch.rand(rows, generator=generator) < 0.2
+    # The compiled Philox PRF keeps one dynamo cache for the whole test process,
+    # which the suite's many context widths and shapes fill: start this test
+    # from an empty one, as an engine process does.
+    torch._dynamo.reset()
     out = {}
     for device in ("cpu", "cuda"):
         verifier = engine.make_verifier(arm, "tsum", width)
