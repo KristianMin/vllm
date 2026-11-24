@@ -4,6 +4,7 @@
 import torch
 
 from vllm.config.watermarking import WatermarkConfig, WatermarkContextScope
+from vllm.v1.watermarking.evaluated_contexts import EvaluatedContexts
 from vllm.v1.watermarking.factory import create_watermarker
 from vllm.v1.watermarking.gumbel import GumbelWatermarker
 from vllm.v1.watermarking.prfs import PhiloxPRF
@@ -57,6 +58,9 @@ class DraftWatermarker:
         )
         self.top_p = torch.ones(max_num_reqs, dtype=torch.float32, device=device)
         self.min_p = torch.zeros(max_num_reqs, dtype=torch.float32, device=device)
+        # deduplicate_contexts "strict": the target sampler's contexts of
+        # earlier verification steps (set by ``prepare``).
+        self.evaluated_contexts: EvaluatedContexts | None = None
 
     def prepare(
         self,
@@ -68,9 +72,13 @@ class DraftWatermarker:
         top_k: torch.Tensor | None = None,
         top_p: torch.Tensor | None = None,
         min_p: torch.Tensor | None = None,
+        evaluated_contexts: EvaluatedContexts | None = None,
     ) -> None:
         """Per-request state in batch order. ``top_k``, ``top_p`` and
-        ``min_p`` are the requests' truncation, which a draft law follows."""
+        ``min_p`` are the requests' truncation, which a draft law follows;
+        ``evaluated_contexts`` the contexts of earlier verification steps
+        (``deduplicate_contexts="strict"``)."""
+        self.evaluated_contexts = evaluated_contexts
         num_reqs = contexts.shape[0]
         self.contexts[:num_reqs].copy_(contexts)
         self.enabled[:num_reqs].copy_(enabled)
@@ -113,6 +121,8 @@ class DraftWatermarker:
             self.deduplicate_contexts_max_history,
             include_prompt=self.deduplicate_contexts == "all",
         )
+        if self.deduplicate_contexts == "strict" and self.evaluated_contexts is not None:
+            enabled &= ~self.evaluated_contexts.contains(contexts, idx_mapping)
         return steps, enabled
 
     def sample(
@@ -143,6 +153,7 @@ class DraftWatermarker:
         processed_logits = logits / torch.where(
             request_temperatures == 0, 1, request_temperatures
         ).unsqueeze(-1)
+        request_enabled = self.enabled[:num_rows] & (request_temperatures != 0)
         if self.uses_draft_law:
             # Watermarked requests draft on the draft law, the others on the
             # temperature-only distribution vLLM's rejection sampling expects.
@@ -153,7 +164,6 @@ class DraftWatermarker:
                 self.top_p[:num_rows],
                 self.min_p[:num_rows],
             )
-            request_enabled = self.enabled[:num_rows] & (request_temperatures != 0)
             processed_logits = torch.where(
                 request_enabled.unsqueeze(-1), law, processed_logits
             )
@@ -170,12 +180,19 @@ class DraftWatermarker:
                 logits if logits_cache_source is None else logits_cache_source
             ),
         )
-        sampled = self.watermarker.sample(
-            processed_logits,
-            contexts,
-            random_sampler=random_sampler,
-            skip_mask=~enabled,
-        ).token_ids
+        if getattr(self.watermarker, "samples_draft_rows", False):
+            # Watermarked requests' repeated rows draw fresh noise of the
+            # watermarker's own instead of vLLM's (SupportsDraftRows).
+            sampled = self.watermarker.sample_draft_rows(
+                processed_logits, contexts, random_sampler, ~enabled, request_enabled
+            )
+        else:
+            sampled = self.watermarker.sample(
+                processed_logits,
+                contexts,
+                random_sampler=random_sampler,
+                skip_mask=~enabled,
+            ).token_ids
 
         contexts.copy_(torch.cat((contexts[:, 1:], sampled.unsqueeze(-1)), dim=-1))
         return sampled

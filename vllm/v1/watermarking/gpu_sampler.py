@@ -10,6 +10,7 @@ from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.watermarking.concordmark import ConcordMarkWatermarker
+from vllm.v1.watermarking.evaluated_contexts import EvaluatedContexts
 from vllm.v1.watermarking.watermarker import (
     RandomSampler,
     SupportsDraftLawVerification,
@@ -31,7 +32,9 @@ class GPUWatermarkSampler(Sampler):
         self,
         watermarker: Watermarker,
         *args,
-        deduplicate_contexts: Literal["none", "single_turn", "all"] = "single_turn",
+        deduplicate_contexts: Literal[
+            "none", "single_turn", "all", "strict"
+        ] = "single_turn",
         deduplicate_contexts_max_history: int | None = 8192,
         **kwargs,
     ) -> None:
@@ -44,6 +47,14 @@ class GPUWatermarkSampler(Sampler):
             deduplicate_contexts = "none"
         self.deduplicate_contexts = deduplicate_contexts
         self.deduplicate_contexts_max_history = deduplicate_contexts_max_history
+        # "strict": the contexts earlier verification steps evaluated.
+        self.evaluated_contexts: EvaluatedContexts | None = None
+        if deduplicate_contexts == "strict":
+            self.evaluated_contexts = EvaluatedContexts(
+                self.sampling_states.max_num_reqs,
+                deduplicate_contexts_max_history or 8192,
+                self.req_states.all_token_ids.gpu.device,
+            )
         self.watermarking = UvaBackedTensor(
             self.sampling_states.max_num_reqs, dtype=torch.bool
         )
@@ -57,6 +68,8 @@ class GPUWatermarkSampler(Sampler):
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         super().add_request(req_idx, sampling_params)
         self.watermarking.np[req_idx] = sampling_params.watermarking
+        if self.evaluated_contexts is not None:
+            self.evaluated_contexts.reset(req_idx)
         if self.stateful:
             self.watermarker.add_request(req_idx)
             resumed = (
@@ -191,12 +204,16 @@ class GPUWatermarkSampler(Sampler):
         enabled = self.watermarking.gpu[expanded_idx_mapping] & (
             self.sampling_states.temperature.gpu[expanded_idx_mapping] != 0
         )
+        evaluated = getattr(self, "evaluated_contexts", None)
+        # The rows of the watermarked requests; every one is evaluated, whatever
+        # the rule then emits, so later steps treat its context as repeated.
+        evaluated_rows = enabled.clone() if evaluated is not None else None
         if (
             draft_logits is not None
             and pos is not None
             and isinstance(self.watermarker, SupportsDraftLawVerification)
         ):
-            return self._draft_law_verification_logits(
+            verification_logits = self._draft_law_verification_logits(
                 processed_logits,
                 expanded_idx_mapping,
                 expanded_local_pos,
@@ -207,6 +224,11 @@ class GPUWatermarkSampler(Sampler):
                 contexts,
                 enabled,
             )
+            if evaluated is not None:
+                evaluated.commit(
+                    contexts, expanded_idx_mapping, expanded_local_pos, evaluated_rows
+                )
+            return verification_logits
         if self.deduplicate_contexts != "none":
             enabled &= ~self._get_repeated_contexts(
                 expanded_idx_mapping, contexts, expanded_local_pos
@@ -238,13 +260,18 @@ class GPUWatermarkSampler(Sampler):
                     use_fp64=self.use_fp64_gumbel,
                 ),
             )
-        return self.watermarker.verification_logits(
+        verification_logits = self.watermarker.verification_logits(
             processed_logits,
             contexts,
             draft_sampled.roll(-1),
             cu_num_logits,
             ~enabled,
         )
+        if evaluated is not None:
+            evaluated.commit(
+                contexts, expanded_idx_mapping, expanded_local_pos, evaluated_rows
+            )
+        return verification_logits
 
     def _draft_law_verification_logits(
         self,
@@ -322,6 +349,9 @@ class GPUWatermarkSampler(Sampler):
                 self.num_speculative_tokens if expanded_local_pos is not None else 0
             ),
         )
+        evaluated = getattr(self, "evaluated_contexts", None)
+        if evaluated is not None:
+            repeated = repeated | evaluated.contains(contexts, expanded_idx_mapping)
         return repeated
 
     def _get_contexts(

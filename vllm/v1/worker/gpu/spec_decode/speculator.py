@@ -495,6 +495,7 @@ class DraftModelSpeculator(BaseSpeculator):
                 "top_p": states.top_p.gpu[idx_mapping],
                 "min_p": states.min_p.gpu[idx_mapping],
             }
+        evaluated = getattr(sampler, "evaluated_contexts", None)
         self.draft_watermarker.prepare(
             sampler._get_contexts(idx_mapping),
             sampler.watermarking.gpu[idx_mapping],
@@ -502,6 +503,7 @@ class DraftModelSpeculator(BaseSpeculator):
             sampler.req_states.prompt_len.gpu,
             sampler.req_states.total_len.gpu,
             **truncation,
+            **({} if evaluated is None else {"evaluated_contexts": evaluated}),
         )
 
     def _copy_request_inputs(
