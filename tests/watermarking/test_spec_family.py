@@ -105,11 +105,13 @@ def test_config_and_factory():
         dict(algorithm="block_verified_gumbel", keyed_drafts=False, verification_law="shared"),
         dict(algorithm="gumbel", residual_race=False),
         dict(algorithm="gumbel", deduplicate_contexts="strict"),
-        dict(algorithm="textseal2", deduplicate_contexts="strict"),
+        dict(algorithm="gaussian_copula", deduplicate_contexts="strict"),
     ):
         with pytest.raises(ValueError):
             WatermarkConfig(key=KEY, **bad)
     WatermarkConfig(key=KEY, algorithm="lookahead_gumbel", deduplicate_contexts="strict")
+    # textseal2 marks every row a round read, as the reference does.
+    WatermarkConfig(key=KEY, algorithm="textseal2", deduplicate_contexts="strict")
 
 
 # ---- the laws and the races ---------------------------------------------------

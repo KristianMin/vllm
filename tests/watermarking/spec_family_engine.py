@@ -33,6 +33,8 @@ from vllm.v1.watermarking import (
     BlockVerifiedGumbelVerificationWatermarker,
     LookaheadGumbelWatermarker,
     SampledDraftWatermarker,
+    TextSeal2DraftLawDraftWatermarker,
+    TextSeal2DraftLawVerificationWatermarker,
 )
 from vllm.v1.watermarking import textseal2_verification as verification
 from vllm.v1.watermarking.block_verified_gumbel import draft_law_logits
@@ -69,7 +71,58 @@ ARMS = {
     "nowm.sp": dict(drafts="sampled", law="point", fresh_lanes=True),
     "nowm.st": dict(drafts="sampled", law="token", fresh_lanes=True),
     "nowm.sb": dict(drafts="sampled", law="block", fresh_lanes=True),
+    # TextSeal2 (copula clocks, TS2_CORRELATION) with the reference's
+    # decisions (``spec_decision``), drafts on the draft law.
+    "ts2.residj": dict(drafts="ts2", law="block", decision="residual_j"),
+    "ts2.residj.t": dict(drafts="ts2", law="token", decision="residual_j"),
+    "ts2.ts2b": dict(drafts="ts2", law="block", decision="fresh_stop"),
+    "ts2.taub": dict(drafts="ts2", law="block", decision="tau_stop"),
+    "ts2.agreeb": dict(drafts="ts2", law="block", decision="agreement"),
+    "ts2.jonly": dict(drafts="sampled", law="block", decision="j_only"),
+    "ts2.residjraw": dict(drafts="ts2", law="block", decision="raw_j"),
+    "ts2.cop2r": dict(drafts="ts2", law="token", decision="fresh_stop"),
+    "ts2.cop2a": dict(drafts="ts2", law="token", decision="agreement"),
 }
+# The TextSeal2 arms' correlation: fully keyed clocks, the hardest case for
+# exactness (no fresh noise in the races).
+TS2_CORRELATION = 1.0
+# The two-key block baselines (``two_key_block_verification``): exact on
+# average over keys, which the engine's per-sequence salts provide.
+ARMS.update(
+    {
+        "tk.gumbel": dict(drafts="two_key", law="block", algorithm="dual_key_gumbel"),
+        "tk.gumbel.t": dict(drafts="two_key", law="token", algorithm="dual_key_gumbel"),
+        "tk.copula": dict(drafts="two_key", law="block", algorithm="gaussian_copula"),
+        "tk.textgrain": dict(drafts="two_key", law="block", algorithm="textgrain"),
+        "tk.synthid": dict(drafts="two_key", law="block", algorithm="synthid"),
+    }
+)
+
+
+def make_two_key(arm: str, width: int):
+    """The two-key block watermarker of arm ``arm`` (small toy parameters)."""
+    from vllm.v1.watermarking import (
+        DualKeyGumbelWatermarker,
+        GaussianCopulaWatermarker,
+        SynthIDWatermarker,
+        TextGrainWatermarker,
+        TwoKeyBlockWatermarker,
+    )
+
+    spec = ARMS[arm]
+    algorithm = spec["algorithm"]
+    textgrain_args = dict(entropy_budget=0.5, num_blocks=4, num_columns=4)
+    synthid_args = dict(depth=6, num_leaves=2)
+    base = {
+        "dual_key_gumbel": lambda: DualKeyGumbelWatermarker(KEY, width, alpha=0.5),
+        "gaussian_copula": lambda: GaussianCopulaWatermarker(KEY, width, correlation=0.9),
+        "textgrain": lambda: TextGrainWatermarker(KEY, width, **textgrain_args),
+        "synthid": lambda: SynthIDWatermarker(KEY, width, **synthid_args),
+    }[algorithm]()
+    return TwoKeyBlockWatermarker(
+        base, algorithm, KEY, width, law=spec["law"], alpha=0.5, correlation=0.9,
+        textgrain_args=textgrain_args, synthid_args=synthid_args,
+    )
 # block_verified_gumbel pass aggregators and the lookahead's names for them.
 PASS_TO_LOOKAHEAD = {
     "identity": "pi1",
@@ -206,6 +259,17 @@ def stop_law(
 
 def make_verifier(arm: str, aggregator: str, width: int):
     spec = ARMS[arm]
+    if "decision" in spec:
+        decision = spec["decision"]
+        return TextSeal2DraftLawVerificationWatermarker(
+            KEY,
+            width,
+            correlation=TS2_CORRELATION,
+            keyed_drafts=spec["drafts"] == "ts2",
+            law=spec["law"],
+            pass_aggregator=aggregator if decision == "residual_j" else "none",
+            spec_decision=decision,
+        )
     if spec.get("lookahead"):
         return LookaheadGumbelWatermarker(KEY, width, aggregator=PASS_TO_LOOKAHEAD[aggregator])
     plain = spec.get("residual_race", True) is False
@@ -251,12 +315,23 @@ def run(
     T = length + K + 1
     text = torch.full((N, T), -1, dtype=torch.long)
     n = torch.zeros(N, dtype=torch.long)
-    if verifier is None:
+    two_key = spec["drafts"] == "two_key"
+    if two_key:
+        top = make_two_key(arm, width + 1)
+        if verifier is None:
+            verifier = top.target_watermarker
+    elif verifier is None:
         verifier = make_verifier(arm, aggregator, width + 1)
     fresh_noise = mask == "strict"
-    if spec["drafts"] == "keyed":
+    if two_key:
+        drafter = top.draft_watermarker
+    elif spec["drafts"] == "keyed":
         drafter = BlockVerifiedGumbelDraftWatermarker(
             KEY, width + 1, fresh_draft_noise=fresh_noise
+        )
+    elif spec["drafts"] == "ts2":
+        drafter = TextSeal2DraftLawDraftWatermarker(
+            KEY, width + 1, correlation=TS2_CORRELATION
         )
     elif spec["drafts"] == "sampled":
         drafter = SampledDraftWatermarker(width + 1)
@@ -309,7 +384,13 @@ def run(
                     logits_cache_col=torch.full((A,), j),
                     generator=generator,
                 )
-                if getattr(drafter, "samples_draft_rows", False):
+                if spec["drafts"] == "ts2":
+                    # Races on the round noise of the request seed, position
+                    # and step, as verification recomputes it.
+                    tokens = drafter.sample(
+                        law, salted(ctx, active), sampler, skip_mask=repeated
+                    ).token_ids
+                elif getattr(drafter, "samples_draft_rows", False):
                     tokens = drafter.sample_draft_rows(
                         law, salted(ctx, active), sampler, repeated, torch.ones(A, dtype=torch.bool)
                     )
@@ -348,7 +429,9 @@ def run(
             )
         else:
             before = (
-                verifier.key_share_stats() if not spec.get("residual_race", True) else None
+                verifier.key_share_stats()
+                if (not spec.get("residual_race", True) or two_key)
+                else None
             )
             output = verifier.draft_law_verification_logits(
                 logits,
