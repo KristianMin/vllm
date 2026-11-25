@@ -40,7 +40,7 @@ from vllm.config.watermarking import (
     derive_watermark_key,
 )
 from vllm.v1.watermarking.binomial import DEFAULT_NUM_TRIALS
-from vllm.v1.watermarking.perplexity import _NUM_RANKED_TOKENS, PPLSoftWatermarker
+from vllm.v1.watermarking.perplexity import PPLSoftWatermarker
 from vllm.v1.watermarking.prfs import PhiloxPRF, WatermarkPRF
 
 _JITTER_DOMAIN = b"lookahead_ppl_jitter"
@@ -187,9 +187,9 @@ class LookaheadPPLSoftWatermarker(PPLSoftWatermarker):
         probability; their offsets ``beta * log max(p, 1e-12)``, float64)."""
         log_probs = logits.float().masked_fill(logits.isnan(), float("-inf"))
         log_probs = log_probs.log_softmax(dim=-1)
-        width = min(logits.shape[-1], _NUM_RANKED_TOKENS)
+        # ppl_soft calibrates and selects over the full sampling support.
         ranked, order = log_probs.sort(dim=-1, descending=True, stable=True)
-        ranked, order = ranked[:, :width].contiguous(), order[:, :width]
+        ranked = ranked.contiguous()
         beta = self.find_beta_for_logp_constraint(
             log_probs, contexts, ranked=ranked
         ).double()
