@@ -1145,7 +1145,10 @@ def test_cuda_watermark_logits_match_the_cpu(algorithm: str, dtype: torch.dtype)
     )
     assert torch.equal(torch.isneginf(cuda), torch.isneginf(cpu))
     finite = torch.isfinite(cpu)
-    torch.testing.assert_close(cuda[finite], cpu[finite], atol=1e-4, rtol=1e-4)
+    # DiPMark's boundary token keeps F - alpha of its mass: its log-mass
+    # amplifies the rounding of the cumulative sums, summed in another order
+    # on CUDA.
+    torch.testing.assert_close(cuda[finite], cpu[finite], atol=1e-4, rtol=1e-3)
     torch.testing.assert_close(
         cuda.double().softmax(-1), cpu.double().softmax(-1), atol=1e-6, rtol=1e-4
     )

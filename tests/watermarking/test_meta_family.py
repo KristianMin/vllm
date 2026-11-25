@@ -370,6 +370,14 @@ def test_fused_detector_null_is_calibrated(algorithm):
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
+@pytest.fixture(autouse=False)
+def fresh_dynamo():
+    # The compiled Philox PRF recompiles per shape; a long pytest process
+    # reaches dynamo's recompile limit (not an engine process).
+    torch._dynamo.reset()
+    yield
+
+
 def _random_round(B=48, n=4, V=40, seed=0, device="cpu"):
     gen = torch.Generator().manual_seed(seed)
     D = n + 1
@@ -390,6 +398,7 @@ def _random_round(B=48, n=4, V=40, seed=0, device="cpu"):
 
 
 @requires_cuda
+@pytest.mark.usefixtures("fresh_dynamo")
 @pytest.mark.parametrize(
     "decision, law",
     [(d, "block") for d in DECISIONS] + [(d, "token") for d in ("residual_j", "fresh_stop", "agreement")],
@@ -430,6 +439,7 @@ def _verification_inputs(device, V=64, sizes=(3, 1, 6, 4), width=4, seed=1):
 
 
 @requires_cuda
+@pytest.mark.usefixtures("fresh_dynamo")
 @pytest.mark.parametrize("decision", ["residual_j", "fresh_stop", "tau_stop", "agreement", "j_only"])
 def test_textseal2_draft_law_verifier_cuda_matches_cpu(decision):
     verifier = TextSeal2DraftLawVerificationWatermarker(
@@ -445,6 +455,7 @@ def test_textseal2_draft_law_verifier_cuda_matches_cpu(decision):
 
 
 @requires_cuda
+@pytest.mark.usefixtures("fresh_dynamo")
 @pytest.mark.parametrize("algorithm", ["dual_key_gumbel", "gaussian_copula", "synthid", "textgrain"])
 def test_two_key_block_cuda_matches_cpu(algorithm):
     config = WatermarkConfig(key=7, algorithm=algorithm, two_key_block_verification=True,
