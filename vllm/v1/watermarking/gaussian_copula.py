@@ -6,12 +6,13 @@
 https://arxiv.org/abs/2609.37310."""
 
 import math
+from typing import Any
 
 import torch
 
 from vllm.config.watermarking import WatermarkPRFName
 from vllm.v1.watermarking.gumbel import (
-    GumbelWatermarkDetector,
+    WeightedGumbelWatermarkDetector,
     _validate_context_width,
 )
 from vllm.v1.watermarking.prfs import PhiloxPRF, WatermarkPRF, create_prf
@@ -157,12 +158,15 @@ class GaussianCopulaWatermarker(Watermarker):
         return WatermarkSample(token_ids, logits)
 
 
-class GaussianCopulaWatermarkDetector(GumbelWatermarkDetector):
+class GaussianCopulaWatermarkDetector(WeightedGumbelWatermarkDetector):
     """Detect a Gaussian copula watermark.
 
     Every distinct (context, token) pair with a full context scores
     ``-log(1 - U)``, which is Exp(1) without the watermark; the p-value is the
     Gamma tail of the summed score, assuming ideal independent PRF uniforms.
+
+    The weighted tests of ``WeightedGumbelWatermarkDetector`` apply, over
+    these positions.
     """
 
     def __init__(
@@ -171,26 +175,46 @@ class GaussianCopulaWatermarkDetector(GumbelWatermarkDetector):
         context_width: int = 4,
         p_value_threshold: float = 0.01,
         prf: WatermarkPRF | WatermarkPRFName = "philox",
+        tokenizer: Any = None,
+        word_start_weight: float = 1.0,
     ) -> None:
         super().__init__(
-            key, context_width, p_value_threshold, prf, deduplicate_contexts=False
+            key,
+            context_width,
+            p_value_threshold,
+            prf,
+            deduplicate_contexts=False,
+            tokenizer=tokenizer,
+            word_start_weight=word_start_weight,
+        )
+
+    def _scored_positions(self, token_ids: list[int]) -> list[int]:
+        """Positions of the first occurrence of each (context, token) pair
+        with a full context (the Gumbel detector's rule is per context)."""
+        width = self.context_width
+        first: dict[tuple[tuple[int, ...], int], int] = {}
+        for stop in range(width, len(token_ids)):
+            pair = (tuple(token_ids[stop - width : stop]), token_ids[stop])
+            first.setdefault(pair, stop)
+        return list(first.values())
+
+    def _pairs(
+        self, token_ids: list[int], positions: list[int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        width = self.context_width
+        if not positions:
+            return (
+                torch.empty((0, width), dtype=torch.int64),
+                torch.empty(0, dtype=torch.int64),
+            )
+        return (
+            torch.tensor(
+                [token_ids[p - width : p] for p in positions], dtype=torch.int64
+            ),
+            torch.tensor([token_ids[p] for p in positions], dtype=torch.int64),
         )
 
     def _prepare_inputs(
         self, token_ids: list[int]
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        width = self.context_width
-        pairs = dict.fromkeys(
-            (tuple(token_ids[stop - width : stop]), token_ids[stop])
-            for stop in range(width, len(token_ids))
-        )
-        if not pairs:
-            return (
-                torch.empty((0, width), dtype=torch.int64),
-                torch.empty(0, dtype=torch.int64),
-            )
-        contexts, targets = zip(*pairs)
-        return (
-            torch.tensor(contexts, dtype=torch.int64),
-            torch.tensor(targets, dtype=torch.int64),
-        )
+        return self._pairs(token_ids, self._scored_positions(token_ids))

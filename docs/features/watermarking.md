@@ -98,7 +98,18 @@ generation.
 
 Watermarking requires speculative decoding to use probabilistic draft sampling,
 standard rejection sampling, and an autoregressive model-based method (`dspark`,
-`eagle`, `eagle3`, or `mtp`). Parallel drafting is supported only by `dspark`.
+`draft_model`, `eagle`, `eagle3`, or `mtp`). Parallel drafting is supported only
+by `dspark`. With `draft_model`, a smaller model that shares the target's
+tokenizer drafts, and its tokens are watermarked like those of the other methods.
+
+Algorithms that verify unwatermarked drafts (the lookahead watermarks and
+textGrain) also accept `"draft_sample_method": "greedy"`; `block_verified_gumbel`
+and `textseal2` race their drafts on the key and need probabilistic drafting. A lookahead row
+accepts a draft only when the draft is the row's race winner, so a draft is
+accepted with the target's probability of it. With probabilistic drafts the
+acceptance rate is Σ p·q, below the Σ min(p, q) of unwatermarked speculative
+decoding; a greedy draft is accepted with the target's probability of the
+drafter's top token, as in unwatermarked greedy drafting.
 
 A watermarking algorithm without native speculative-decoding support is
 rejected before model loading. Set
@@ -136,6 +147,10 @@ context:
 - `"none"` disables context deduplication.
 - `"single_turn"`, the default, searches the tokens generated for the current
   request. This gives single-turn non-distortion.
+- `"strict"` (`lookahead_gumbel` and `block_verified_gumbel` only) searches
+  like `"single_turn"` and also counts as repeated every context an earlier
+  speculative verification step of the request evaluated, including rows past
+  the first rejection (see [Block-verified Gumbel-max](#block-verified-gumbel-max)).
 - `"all"` also searches the prompt, which extends non-distortion across the
   turns of a conversation. The first `context_width` generated tokens use
   ordinary sampling, and subsequent tokens whose context already occurs in the
@@ -418,7 +433,10 @@ vllm serve MODEL \
 ```
 
 `context_width` and context deduplication are ignored. Classes are built from
-the tokenizer at startup, so `skip_tokenizer_init` is rejected. Per-request
+the tokenizer at startup, so `skip_tokenizer_init` is rejected. Words are Latin
+letters (`a-z`) by default; `"lexical_letters":"latin_cyrillic"` also groups
+words of lowercase Cyrillic letters (`а-я`, `ѐ-џ`), for Cyrillic-script output.
+The detector takes the same `lexical_letters`. Per-request
 state takes `4 * num_eligible_classes + vocab_size / 8` bytes per
 `max_num_seqs` slot (about 184 KB for Llama 3). Speculative decoding is not
 supported.
@@ -463,6 +481,31 @@ detector = ConcordMarkWatermarkDetector(key=42)
 result = detector.detect(token_ids)
 result = detector.detect(token_ids, logprobs)  # [(logprob, {token: logprob}), ...]
 ```
+
+`DualKeyGumbelWatermarkDetector` also provides the entropy-weighted and
+localized detection of [TextSeal](https://arxiv.org/abs/2605.12456). Both take
+optional per-token entropies, where `entropies[t]` is the entropy of the
+next-token distribution that produced token `t`, as computed by the generating
+model or a proxy model. With entropies, `detect` runs the entropy-weighted
+test instead of the unweighted one: it gives less weight to low-entropy tokens,
+which carry little watermark. `detect_localized` also tests windows of the
+text, so it can detect watermarked passages inside other text, and reports
+where they are:
+
+```python
+from vllm.v1.watermarking import DualKeyGumbelWatermarkDetector
+
+detector = DualKeyGumbelWatermarkDetector(key=42, alpha=0.1)
+weighted = detector.detect(token_ids, entropies=entropies)
+localized = detector.detect_localized(token_ids, entropies=entropies)
+print(localized.p_value, localized.regions)
+```
+
+`regions` lists the watermarked spans as `(start, end, p_value)` token
+positions, `end` exclusive. It is empty when the test of the whole text gives
+the smallest p-value. The localized p-value is corrected for the number of
+windows and tests tried. Without entropies, `detect_localized` runs only the
+unweighted tests.
 
 ### SynthID-Text
 
@@ -531,8 +574,145 @@ from vllm.v1.watermarking import GaussianCopulaWatermarkDetector
 result = GaussianCopulaWatermarkDetector(key=42, context_width=2).detect(token_ids)
 ```
 
+Two weighted tests sum `w * -log(1 - U)` with weights `w` from 1 to 3.5 in
+steps of 0.25, and report the tail of that sum for independent Exp(1) scores by
+a saddlepoint (Lugannani-Rice) approximation. AutoMark's surprisal weighting
+takes a detection model's log-probability of each token, for example from a
+forward pass over the text alone, and weighs a score by
+`1 + min(-logprob, 2.5)`. The text-only weighting gives `word_start_weight` to
+tokens that start a word (a leading space, or after a token without letters or
+digits) or follow a sentence end (a token ending in `.!?:;`), and 1 to tokens
+after a newline and inside words:
+
+```python
+detector = GaussianCopulaWatermarkDetector(key=42, context_width=2)
+result = detector.detect(token_ids, logprobs=token_logprobs)
+
+detector = GaussianCopulaWatermarkDetector(
+    key=42, context_width=2, tokenizer=tokenizer, word_start_weight=3.0
+)
+result = detector.detect(token_ids)
+```
+
+The same weighted tests detect Gumbel-max watermarks (`gumbel`, `lookahead_gumbel`) with
+`WeightedGumbelWatermarkDetector`, over the positions `GumbelWatermarkDetector` scores.
+
 The Gaussian copula watermark does not support
 [speculative decoding](#speculative-decoding).
+
+### TextSeal2
+
+TextSeal2 ([arXiv:2610.40613](https://arxiv.org/abs/2610.40613)) is the
+Gaussian copula watermark on a virtual key that mixes two keys derived from the
+master key, A and B: every candidate gets
+`G* = (ndtri(U_A) + ndtri(U_B)) / sqrt(2)` and races on
+`z = correlation * G* + sqrt(1 - correlation**2) * N`. Tokens follow the
+model's distribution, as for the copula. `correlation` defaults to 0.9, the
+paper's value. The first `context_width` tokens of an output and repeated
+contexts are sampled without the watermark:
+
+```bash
+vllm serve MODEL \
+  --watermark-config '{"algorithm":"textseal2","key":42}'
+```
+
+Detection scores every distinct (context, token) pair once. The private
+detector, which needs the master key, sums `-log Phi(-G*)`; the public
+detector needs only key A and sums `-log(1 - U_A)`, with `1 / sqrt(2)` of the
+signal. Both report the Gamma tail of the sum. With per-token entropies they
+run TextSeal's entropy-weighted test, and `detect_localized` runs TextSeal's
+localized detection:
+
+```python
+from vllm.v1.watermarking import TextSeal2WatermarkDetector
+
+detector = TextSeal2WatermarkDetector(key=42)
+private = detector.detect(token_ids)
+public = TextSeal2WatermarkDetector(detector.public_key, public=True).detect(token_ids)
+```
+
+Under speculative decoding TextSeal2 follows the paper's rule: the drafter
+races every draft on the key, and verification runs one more race, on the
+leftovers of the drafts' clocks, that decides where the drafted path stops and
+which token is emitted there. The output keeps the model's distribution, the
+acceptance is that of block verification (`"verification_law": "token"` for
+token-level verification), and every emitted token is watermarked. The noise
+of a draft race and of its verification is a public function of the request
+seed, the position and the draft step, so the two agree without extra state.
+`"keyed_drafts": false` leaves the drafts unwatermarked instead, and accepts
+each draft with its target probability. `pass_aggregator` (`tsum`, `expsum` or
+`max`) adds a lookahead on the race, outside the paper, that keeps the output
+distribution and acceptance and raises the scores of kept drafts:
+
+```bash
+vllm serve MODEL \
+  --speculative-config \
+  '{"method":"mtp","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}' \
+  --watermark-config '{"algorithm":"textseal2","key":42,"context_width":4}'
+```
+
+`lookahead_textseal2` verifies unwatermarked drafts with lookahead Gumbel-max's
+recursion on TextSeal2's noise instead, with `aggregator` and
+`aggregator_lambda` as for the other lookahead watermarks. Both rules read the
+clocks of rows they then discard, so `context_width` should be at least
+`num_speculative_tokens`.
+
+### Block-verified Gumbel-max
+
+`block_verified_gumbel` is Gumbel-max (`gumbel`'s key, PRF and contexts; without
+speculation it is `gumbel`) with TextSeal2's speculative rule on Gumbel-max's
+own clocks `E(v) = -log U(v)`: the drafter races every draft on the key,
+`d = argmin_v E(v) / q(v)`, on a draft law `q` truncated like the target
+(temperature, then the request's min-p, top-k and top-p), and verification runs
+one race on the leftovers `E - tau q` (`tau = E(d) / q(d)`) at the speeds of
+block verification's outcome law (`"verification_law": "token"` for
+token-level verification, `"shared"` for the shared-clock baseline that accepts
+a draft iff it is the target's own Gumbel-max token). The output keeps the
+model's distribution, the acceptance is block verification's, and every
+emitted token scores with `GumbelWatermarkDetector` as for `gumbel`.
+`pass_aggregator` (`identity`, `max`, `tsum`, `expsum`; `none` is the one-shot
+race) mixes each draft race's time into the race's backward chain without
+changing the output distribution or the acceptance. Repeated contexts race on
+fresh noise of the request seed, position and draft step. It needs
+probabilistic drafting:
+
+```bash
+vllm serve MODEL \
+  --speculative-config \
+  '{"method":"mtp","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}' \
+  --watermark-config '{"algorithm":"block_verified_gumbel","key":42,"pass_aggregator":"tsum"}'
+```
+
+As for the lookahead watermarks, `context_width` should be at least
+`num_speculative_tokens`.
+
+The same algorithm runs the other members of the speculative family (the codes
+are `<draft><verification>.<aggregator>`: drafts greedy `g`, sampled `s` or
+keyed `k`; verification point-mass `p`, token-level `t` or block `b`):
+
+| Code | Configuration (besides the key) | Rule |
+|---|---|---|
+| `kb.*`, `kt.*` | `"verification_law": "block"` / `"token"` | keyed drafts, residual race on the leftovers |
+| `kpr.*` | `"verification_law": "point"` | the same at point-mass verification's law: a draft is kept with its target probability |
+| `kp.pi1` | `"verification_law": "shared"` | keyed drafts, a draft kept iff it is the target's own Gumbel-max token |
+| `kb.plain` | `"residual_race": false` | keyed drafts, plain block verification: the stopping row from fresh randomness, the bonus token with the key, the token after a rejection with a second key |
+| `sb.*`, `st.*`, `sp.*` | `"keyed_drafts": false` and the law | drafts sampled from the draft law with fresh noise; lookahead Gumbel-max's recursion on the raw keyed clocks with the verification law as the rows' weights |
+| `nowm.sb`, `nowm.st`, `nowm.sp` | `"keyed_drafts": false, "fresh_lanes": true` and the law | the unwatermarked baselines: sampled drafts verified on fresh clocks |
+| `gp.*` | `lookahead_gumbel` with greedy drafts | lookahead Gumbel-max |
+
+`pass_aggregator` is the aggregator (`identity` = `pi1`, `none` = `pi2`,
+`tsum`, `max`, `expsum`); every member keeps the model's distribution and has
+the acceptance of its verification law, the same for every aggregator.
+`kb.plain` is detected by `FusedTwoKeyGumbelWatermarkDetector` (the score
+`a s_A + (1 - a) s_B` of both keys with the exact p-value of the sum), whose
+weight `a` is the run's share of key-A tokens; the verifier counts them, and
+with `VLLM_BV_GUMBEL_KEY_LOG=<path>` writes the running counts to that file.
+With `"deduplicate_contexts": "strict"` (`lookahead_gumbel` and
+`block_verified_gumbel`), a context that any row of an earlier verification step
+of the request evaluated counts as repeated too: the lookahead and residual
+races read the keyed clocks of rows past the first rejection, and `strict`
+keeps them from being raced on again, so the output stays exact (with
+`single_turn`, only the row-wise rules `pi1` and `shared` are).
 
 ## Pseudorandom functions
 

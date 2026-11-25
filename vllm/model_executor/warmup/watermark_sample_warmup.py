@@ -13,8 +13,9 @@ sampler path can launch for the configured watermark.
 ``_philox_gaussian_copula_kernel`` is keyed the same way, except that it always
 gets a skip mask.
 
-The SynthID and textGrain watermarkers launch their kernels from ``sample``,
-so for them the warmup samples once per logits dtype and skip-mask setting.
+The SynthID, textGrain and TextSeal2 watermarkers launch their kernels from
+``sample``, so for them the warmup samples once per logits dtype and skip-mask
+setting.
 
 The generic sampler warmup runs the chi-squared and perplexity watermarkers
 on fp32 logits. The perplexity watermarkers convert logits to fp32 before
@@ -56,6 +57,8 @@ def _philox_sampler_keys(watermarker: Watermarker) -> list[int]:
     """Philox keys the sampler launches the kernel with."""
     from vllm.v1.watermarking.gumbel import DualKeyGumbelWatermarker
 
+    # Lookahead variants of other watermarks sample with them.
+    watermarker = getattr(watermarker, "sampling_watermarker", watermarker)
     watermarkers: list[Watermarker] = [watermarker]
     if isinstance(watermarker, DualKeyGumbelWatermarker):
         # ``DualKeyGumbelWatermarker.sample`` launches once per key, and
@@ -78,6 +81,7 @@ def _philox_gaussian_copula_args(watermarker: Watermarker) -> tuple[int, float] 
     from vllm.v1.watermarking.gaussian_copula import GaussianCopulaWatermarker
     from vllm.v1.watermarking.prfs import PhiloxPRF
 
+    watermarker = getattr(watermarker, "sampling_watermarker", watermarker)
     if not isinstance(watermarker, GaussianCopulaWatermarker):
         return None
     prf = watermarker.prf
@@ -162,6 +166,22 @@ def _philox_textgrain_watermarker(watermarker: Watermarker):
     return None
 
 
+def _philox_textseal2_watermarker(watermarker: Watermarker):
+    """The watermarker sampling with the TextSeal2 kernel, else None."""
+    from vllm.v1.watermarking.prfs import PhiloxPRF
+    from vllm.v1.watermarking.textseal2 import TextSeal2Watermarker
+
+    # The lookahead variant samples with its TextSeal2 watermarker.
+    watermarker = getattr(watermarker, "sampling_watermarker", watermarker)
+    if (
+        isinstance(watermarker, TextSeal2Watermarker)
+        and type(watermarker.prf) is PhiloxPRF
+        and type(watermarker.key_b_prf) is PhiloxPRF
+    ):
+        return watermarker
+    return None
+
+
 @torch.inference_mode()
 def watermark_sample_warmup(worker: Worker) -> None:
     if getattr(worker.vllm_config, "watermark_config", None) is None:
@@ -207,6 +227,7 @@ def watermark_sample_warmup(worker: Worker) -> None:
         chi_squared = _philox_chi_squared_watermarker(sampler.watermarker)
         synthid = _philox_synthid_watermarker(sampler.watermarker)
         textgrain = _philox_textgrain_watermarker(sampler.watermarker)
+        textseal2 = _philox_textseal2_watermarker(sampler.watermarker)
         gaussian_copula_args = _philox_gaussian_copula_args(sampler.watermarker)
         if (
             not keys
@@ -215,6 +236,7 @@ def watermark_sample_warmup(worker: Worker) -> None:
             and chi_squared is None
             and synthid is None
             and textgrain is None
+            and textseal2 is None
             and gaussian_copula_args is None
         ):
             return
@@ -366,7 +388,7 @@ def watermark_sample_warmup(worker: Worker) -> None:
                     use_fp64=sampler.use_fp64_gumbel,
                     **sampling_state,
                 )
-            for sampled in (synthid, textgrain):
+            for sampled in (synthid, textgrain, textseal2):
                 if sampled is None:
                     continue
                 random_sampler = RandomSampler(

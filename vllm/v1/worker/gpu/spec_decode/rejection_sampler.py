@@ -279,6 +279,8 @@ class RejectionSampler:
                 expanded_local_pos,
                 draft_sampled,
                 cu_num_logits,
+                draft_logits=draft_logits,
+                pos=pos,
             )
         sampled, num_sampled = rejection_sample(
             verification_logits,

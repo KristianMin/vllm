@@ -10,8 +10,11 @@ from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.watermarking.concordmark import ConcordMarkWatermarker
+from vllm.v1.watermarking.evaluated_contexts import EvaluatedContexts
 from vllm.v1.watermarking.watermarker import (
     RandomSampler,
+    SupportsDraftLawVerification,
+    SupportsResidualVerification,
     SupportsVerificationLogits,
     Watermarker,
 )
@@ -29,7 +32,9 @@ class GPUWatermarkSampler(Sampler):
         self,
         watermarker: Watermarker,
         *args,
-        deduplicate_contexts: Literal["none", "single_turn", "all"] = "single_turn",
+        deduplicate_contexts: Literal[
+            "none", "single_turn", "all", "strict"
+        ] = "single_turn",
         deduplicate_contexts_max_history: int | None = 8192,
         **kwargs,
     ) -> None:
@@ -42,6 +47,14 @@ class GPUWatermarkSampler(Sampler):
             deduplicate_contexts = "none"
         self.deduplicate_contexts = deduplicate_contexts
         self.deduplicate_contexts_max_history = deduplicate_contexts_max_history
+        # "strict": the contexts earlier verification steps evaluated.
+        self.evaluated_contexts: EvaluatedContexts | None = None
+        if deduplicate_contexts == "strict":
+            self.evaluated_contexts = EvaluatedContexts(
+                self.sampling_states.max_num_reqs,
+                deduplicate_contexts_max_history or 8192,
+                self.req_states.all_token_ids.gpu.device,
+            )
         self.watermarking = UvaBackedTensor(
             self.sampling_states.max_num_reqs, dtype=torch.bool
         )
@@ -55,6 +68,8 @@ class GPUWatermarkSampler(Sampler):
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         super().add_request(req_idx, sampling_params)
         self.watermarking.np[req_idx] = sampling_params.watermarking
+        if self.evaluated_contexts is not None:
+            self.evaluated_contexts.reset(req_idx)
         if self.stateful:
             self.watermarker.add_request(req_idx)
             resumed = (
@@ -167,14 +182,20 @@ class GPUWatermarkSampler(Sampler):
         expanded_local_pos: torch.Tensor,
         draft_sampled: torch.Tensor,
         cu_num_logits: torch.Tensor,
+        draft_logits: torch.Tensor | None = None,
+        pos: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The logits rejection sampling verifies, from the watermarker's
-        ``verification_logits``.
+        ``verification_logits``, or its ``draft_law_verification_logits`` or
+        ``residual_verification_logits`` when it has one and the drafts were
+        sampled probabilistically.
 
         ``draft_sampled`` holds each row's input token, so the draft row ``i``
         verifies is ``draft_sampled[i + 1]``, and each row's context ends with
-        the drafted tokens before it. Opted-out, greedy and deduplicated rows
-        keep their logits.
+        the drafted tokens before it. ``draft_logits`` is the drafter's
+        pre-temperature logits cache [max_num_reqs, num_speculative_steps,
+        vocab] and ``pos`` each row's position. Opted-out, greedy and
+        deduplicated rows keep their logits.
         """
         assert isinstance(self.watermarker, SupportsVerificationLogits)
         contexts = self._get_contexts(
@@ -183,16 +204,126 @@ class GPUWatermarkSampler(Sampler):
         enabled = self.watermarking.gpu[expanded_idx_mapping] & (
             self.sampling_states.temperature.gpu[expanded_idx_mapping] != 0
         )
+        evaluated = getattr(self, "evaluated_contexts", None)
+        # The rows of the watermarked requests; every one is evaluated, whatever
+        # the rule then emits, so later steps treat its context as repeated.
+        evaluated_rows = enabled.clone() if evaluated is not None else None
+        if (
+            draft_logits is not None
+            and pos is not None
+            and isinstance(self.watermarker, SupportsDraftLawVerification)
+        ):
+            verification_logits = self._draft_law_verification_logits(
+                processed_logits,
+                expanded_idx_mapping,
+                expanded_local_pos,
+                draft_sampled,
+                cu_num_logits,
+                draft_logits,
+                pos,
+                contexts,
+                enabled,
+            )
+            if evaluated is not None:
+                evaluated.commit(
+                    contexts, expanded_idx_mapping, expanded_local_pos, evaluated_rows
+                )
+            return verification_logits
         if self.deduplicate_contexts != "none":
             enabled &= ~self._get_repeated_contexts(
                 expanded_idx_mapping, contexts, expanded_local_pos
             )
-        return self.watermarker.verification_logits(
+        if (
+            draft_logits is not None
+            and pos is not None
+            and isinstance(self.watermarker, SupportsResidualVerification)
+        ):
+            requests = expanded_idx_mapping.long().clamp_min(0)
+            steps = expanded_local_pos.long().clamp(0, draft_logits.shape[1] - 1)
+            temperatures = self.sampling_states.temperature.gpu[requests]
+            temperatures = torch.where(temperatures == 0, 1, temperatures)
+            row_draft_logits = draft_logits[
+                requests, steps, : processed_logits.shape[-1]
+            ].float() / temperatures.unsqueeze(-1)
+            return self.watermarker.residual_verification_logits(
+                processed_logits,
+                contexts,
+                draft_sampled.roll(-1),
+                cu_num_logits,
+                ~enabled,
+                row_draft_logits,
+                RandomSampler(
+                    expanded_idx_mapping=expanded_idx_mapping,
+                    temperatures=self.sampling_states.temperature.gpu,
+                    seeds=self.sampling_states.seeds.gpu,
+                    positions=pos,
+                    use_fp64=self.use_fp64_gumbel,
+                ),
+            )
+        verification_logits = self.watermarker.verification_logits(
             processed_logits,
             contexts,
             draft_sampled.roll(-1),
             cu_num_logits,
             ~enabled,
+        )
+        if evaluated is not None:
+            evaluated.commit(
+                contexts, expanded_idx_mapping, expanded_local_pos, evaluated_rows
+            )
+        return verification_logits
+
+    def _draft_law_verification_logits(
+        self,
+        processed_logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        expanded_local_pos: torch.Tensor,
+        draft_sampled: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+        draft_logits: torch.Tensor,
+        pos: torch.Tensor,
+        contexts: torch.Tensor,
+        request_enabled: torch.Tensor,
+    ) -> torch.Tensor:
+        """``draft_law_verification_logits`` with each row's draft law, from
+        the cached draft logits as the drafter computed it: temperature, then
+        the request's truncation (``draft_law_logits``)."""
+        assert isinstance(self.watermarker, SupportsDraftLawVerification)
+        requests = expanded_idx_mapping.long().clamp_min(0)
+        steps = expanded_local_pos.long().clamp(0, draft_logits.shape[1] - 1)
+        states = self.sampling_states
+        temperatures = states.temperature.gpu[requests]
+        temperatures = torch.where(temperatures == 0, 1, temperatures)
+        row_draft_logits = draft_logits[
+            requests, steps, : processed_logits.shape[-1]
+        ].float() / temperatures.unsqueeze(-1)
+        draft_law = self.watermarker.draft_law_logits(
+            row_draft_logits,
+            states.top_k.gpu[requests],
+            states.top_p.gpu[requests],
+            states.min_p.gpu[requests],
+        )
+        if self.deduplicate_contexts != "none":
+            repeated = self._get_repeated_contexts(
+                expanded_idx_mapping, contexts, expanded_local_pos
+            )
+        else:
+            repeated = torch.zeros_like(request_enabled)
+        return self.watermarker.draft_law_verification_logits(
+            processed_logits,
+            contexts,
+            draft_sampled.roll(-1),
+            cu_num_logits,
+            request_enabled,
+            repeated,
+            draft_law,
+            RandomSampler(
+                expanded_idx_mapping=expanded_idx_mapping,
+                temperatures=states.temperature.gpu,
+                seeds=states.seeds.gpu,
+                positions=pos,
+                use_fp64=self.use_fp64_gumbel,
+            ),
         )
 
     def _get_repeated_contexts(
@@ -218,6 +349,9 @@ class GPUWatermarkSampler(Sampler):
                 self.num_speculative_tokens if expanded_local_pos is not None else 0
             ),
         )
+        evaluated = getattr(self, "evaluated_contexts", None)
+        if evaluated is not None:
+            repeated = repeated | evaluated.contains(contexts, expanded_idx_mapping)
         return repeated
 
     def _get_contexts(

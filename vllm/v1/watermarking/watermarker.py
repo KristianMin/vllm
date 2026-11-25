@@ -133,3 +133,77 @@ class SupportsVerificationLogits(Protocol):
         Rows in ``skip_mask`` must keep their logits.
         """
         ...
+
+
+@runtime_checkable
+class SupportsResidualVerification(Protocol):
+    """A watermarker whose verification also reads the drafts' distributions
+    and the request seeds and positions the drafts were raced with
+    (TextSeal2's speculative rule). Used instead of ``verification_logits``
+    when the drafts were sampled probabilistically."""
+
+    def residual_verification_logits(
+        self,
+        logits: torch.Tensor,
+        contexts: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+        skip_mask: torch.Tensor,
+        draft_logits: torch.Tensor,
+        random_sampler: RandomSampler,
+    ) -> torch.Tensor:
+        """As ``SupportsVerificationLogits.verification_logits``.
+        ``draft_logits`` [num_logits, vocab] are the temperature-scaled draft
+        logits each draft row's draft was sampled from (arbitrary at bonus
+        rows), and ``random_sampler`` holds each row's request seed and
+        position."""
+        ...
+
+
+@runtime_checkable
+class SupportsDraftLaw(Protocol):
+    """A draft watermarker whose drafts race on a draft law truncated like the
+    target, instead of the drafter's temperature-only distribution."""
+
+    def draft_law_logits(
+        self,
+        logits: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        min_p: torch.Tensor,
+    ) -> torch.Tensor:
+        """The draft law's logits, -inf outside its support, from
+        temperature-scaled draft ``logits`` [rows, vocab] and each row's
+        request's ``top_k``, ``top_p`` and ``min_p`` [rows]. Must be a
+        deterministic function of its inputs without host synchronization: the
+        drafter calls it (possibly inside a CUDA graph) and verification calls
+        it again on the cached draft logits."""
+        ...
+
+
+@runtime_checkable
+class SupportsDraftLawVerification(SupportsDraftLaw, Protocol):
+    """A watermarker that verifies keyed drafts raced on ``draft_law_logits``
+    (block_verified_gumbel). Used instead of ``verification_logits`` when the
+    drafts were sampled probabilistically."""
+
+    def draft_law_verification_logits(
+        self,
+        logits: torch.Tensor,
+        contexts: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+        request_enabled: torch.Tensor,
+        repeated: torch.Tensor,
+        draft_law: torch.Tensor,
+        random_sampler: RandomSampler,
+    ) -> torch.Tensor:
+        """As ``SupportsVerificationLogits.verification_logits``, with the
+        request-level ``request_enabled`` [num_logits] (watermarked, not
+        greedy: those requests' drafts raced on the draft law, the others' on
+        the temperature-only draft distribution) and the row-level
+        ``repeated`` [num_logits] (repeated contexts) instead of
+        ``skip_mask``, each row's ``draft_law`` [num_logits, vocab] (arbitrary
+        at bonus rows) and ``random_sampler`` with each row's request seed and
+        position."""
+        ...

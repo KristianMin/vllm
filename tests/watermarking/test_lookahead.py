@@ -162,7 +162,7 @@ def test_pi1_is_plain_gumbel_max_and_bonus_rows_never_look_ahead():
             assert torch.equal(chosen, plain)
 
 
-@pytest.mark.parametrize("aggregator", ["tsum", "max", "expsum"])
+@pytest.mark.parametrize("aggregator", ["tsum", "max", "expsum", "optpath"])
 def test_every_row_stays_an_exact_sample(aggregator: str):
     """A drafted row picks each token with its probability, whatever the
     child's value, because the aggregate is a fresh standard Gumbel."""
@@ -238,3 +238,92 @@ def test_kernels_match_the_reference(aggregator: str, dtype: torch.dtype):
     assert torch.equal(output[skip], rows["logits"][skip])
     assert torch.equal(output[~skip].float().argmax(-1), expected[~skip])
     assert (output[~skip] == 0).sum(-1).eq(1).all()
+
+
+def test_optpath_is_accepted_only_by_lookahead_gumbel():
+    WatermarkConfig(algorithm="lookahead_gumbel", key=1, aggregator="optpath")
+    for algorithm in ("lookahead_dual_key_gumbel", "lookahead_gaussian_copula"):
+        with pytest.raises(ValueError, match="supports the aggregators"):
+            WatermarkConfig(algorithm=algorithm, key=1, aggregator="optpath")
+
+
+def _optpath_paths(depth: int, num_paths: int, seed: int):
+    from tests.watermarking.test_lookahead_ppl import _paths
+
+    generator = torch.Generator().manual_seed(seed)
+    logits = 1.5 * torch.randn(depth, 5, generator=generator)
+    drafts = [int(logits[i].argmax()) for i in range(depth - 1)]
+    return logits, drafts, _paths(num_paths, logits, drafts, seed=seed + 1)
+
+
+def _lookahead_chosen(watermarker, rows):
+    children = watermarker.children(rows["draft_tokens"], rows["cu_num_logits"])
+    return watermarker.lookahead_tokens(
+        rows["logits"],
+        rows["contexts"],
+        children,
+        rows["cu_num_logits"],
+        rows["skip_mask"],
+    )
+
+
+def test_optpath_keeps_the_emitted_path_exact():
+    """With optpath linking every drafted row, the joint law of the first
+    rejection and the token emitted there is the product of the rows' laws."""
+    vocab_size, depth, num_paths = 5, 4, 8000
+    logits, drafts, rows = _optpath_paths(depth, num_paths, seed=3)
+    watermarker = LookaheadGumbelWatermarker(
+        key=13, context_width=depth, aggregator="optpath"
+    )
+
+    chosen = _lookahead_chosen(watermarker, rows).view(num_paths, depth)
+
+    laws = logits.double().softmax(-1)
+    expected = torch.zeros(depth, vocab_size, dtype=torch.float64)
+    observed = torch.zeros(depth, vocab_size, dtype=torch.float64)
+    reach = float(num_paths)
+    alive = torch.ones(num_paths, dtype=torch.bool)
+    for i in range(depth):
+        row_law = laws[i].clone()
+        if i < depth - 1:
+            row_law[drafts[i]] = 0.0  # emitted here only when rejected
+        expected[i] = reach * row_law
+        emitted = alive & ((chosen[:, i] != drafts[i]) if i < depth - 1 else True)
+        observed[i] = torch.bincount(chosen[emitted, i], minlength=vocab_size).double()
+        if i < depth - 1:
+            reach *= laws[i, drafts[i]].item()
+            alive = alive & (chosen[:, i] == drafts[i])
+    keep = expected >= 5
+    chi2 = ((observed[keep] - expected[keep]) ** 2 / expected[keep]).sum().item()
+    dof = int(keep.sum()) - 1
+    # chi-square upper tail via the Wilson-Hilferty normal approximation
+    z = ((chi2 / dof) ** (1 / 3) - (1 - 2 / (9 * dof))) / math.sqrt(2 / (9 * dof))
+    assert z < 3.5, (chi2, dof, observed, expected)
+
+
+def test_optpath_raises_the_emitted_score_at_equal_acceptance():
+    depth, num_paths = 6, 4000
+    _, drafts, rows = _optpath_paths(depth, num_paths, seed=5)
+    results = {}
+    for aggregator in ("pi1", "tsum", "optpath"):
+        watermarker = LookaheadGumbelWatermarker(
+            key=17, context_width=depth, aggregator=aggregator
+        )
+        chosen = _lookahead_chosen(watermarker, rows).view(num_paths, depth)
+        uniforms = watermarker.prf.uniform(
+            rows["contexts"], chosen.view(-1, 1)
+        ).squeeze(-1)
+        scores = (-torch.log1p(-uniforms.double())).view(num_paths, depth)
+        rejected = chosen != torch.tensor(drafts + [-1])
+        first = torch.where(
+            rejected.any(1), rejected.to(torch.int8).argmax(1), depth - 1
+        )
+        emitted = torch.arange(depth).unsqueeze(0) <= first.unsqueeze(1)
+        results[aggregator] = (
+            (scores * emitted).sum().item() / emitted.sum().item() - 1.0,
+            first.double().mean().item(),
+        )
+    # Acceptance is the same: every row keeps its law.
+    assert abs(results["optpath"][1] - results["pi1"][1]) < 0.06, results
+    assert results["optpath"][0] > 1.05 * results["pi1"][0], results
+    assert results["optpath"][0] >= 0.95 * results["tsum"][0], results

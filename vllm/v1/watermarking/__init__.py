@@ -3,6 +3,14 @@
 
 from vllm.config.watermarking import derive_watermark_key
 from vllm.v1.watermarking.binomial import BinomialScoreWatermarkDetector
+from vllm.v1.watermarking.block_verified_gumbel import (
+    BlockVerifiedGumbelDraftWatermarker,
+    BlockVerifiedGumbelVerificationWatermarker,
+    BlockVerifiedGumbelWatermarker,
+    FusedTwoKeyGumbelWatermarkDetector,
+    FusedWatermarkDetection,
+    SampledDraftWatermarker,
+)
 from vllm.v1.watermarking.chi_squared import ChiSquaredWatermarker
 from vllm.v1.watermarking.concordmark import (
     ConcordMarkWatermarkDetector,
@@ -19,8 +27,17 @@ from vllm.v1.watermarking.gumbel import (
     DualKeyGumbelWatermarker,
     GumbelWatermarkDetector,
     GumbelWatermarker,
+    WeightedGumbelWatermarkDetector,
 )
-from vllm.v1.watermarking.lookahead import LookaheadGumbelWatermarker
+from vllm.v1.watermarking.localized import LocalizedWatermarkDetection
+from vllm.v1.watermarking.lookahead import (
+    LookaheadDualKeyGumbelWatermarker,
+    LookaheadGaussianCopulaWatermarker,
+    LookaheadGumbelWatermarker,
+    LookaheadTextSeal2Watermarker,
+)
+from vllm.v1.watermarking.lookahead_ppl import LookaheadPPLSoftWatermarker
+from vllm.v1.watermarking.lookahead_textgrain import LookaheadTextGrainWatermarker
 from vllm.v1.watermarking.multibit_red_green import (
     MultibitRedGreenWatermarkDetector,
     MultibitRedGreenWatermarker,
@@ -50,7 +67,16 @@ from vllm.v1.watermarking.textgrain import (
     TextGrainWatermarkDetector,
     TextGrainWatermarker,
 )
+from vllm.v1.watermarking.textseal2 import (
+    TextSeal2SpeculativeWatermarker,
+    TextSeal2VerificationWatermarker,
+    TextSeal2WatermarkDetector,
+    TextSeal2Watermarker,
+)
 from vllm.v1.watermarking.watermarker import (
+    SupportsDraftLaw,
+    SupportsDraftLawVerification,
+    SupportsResidualVerification,
     SupportsSpeculativeDecoding,
     SupportsVerificationLogits,
     Watermarker,
@@ -61,30 +87,50 @@ __all__ = [
     "ConcordMarkWatermarkDetector",
     "ConcordMarkWatermarker",
     "BinomialScoreWatermarkDetector",
+    "BlockVerifiedGumbelDraftWatermarker",
+    "BlockVerifiedGumbelVerificationWatermarker",
+    "BlockVerifiedGumbelWatermarker",
     "ChiSquaredWatermarker",
     "DualKeyGumbelWatermarkDetector",
+    "FusedTwoKeyGumbelWatermarkDetector",
+    "FusedWatermarkDetection",
     "DualKeyGumbelWatermarker",
     "GaussianCopulaWatermarkDetector",
     "GaussianCopulaWatermarker",
     "GumbelWatermarkDetector",
+    "WeightedGumbelWatermarkDetector",
     "GumbelWatermarker",
     "MultibitRedGreenWatermarkDetector",
     "MultibitRedGreenWatermarker",
     "MultibitWatermarkDetection",
+    "LookaheadDualKeyGumbelWatermarker",
+    "LookaheadGaussianCopulaWatermarker",
     "LookaheadGumbelWatermarker",
+    "LookaheadTextSeal2Watermarker",
+    "LookaheadPPLSoftWatermarker",
+    "LookaheadTextGrainWatermarker",
     "PPLHardWatermarker",
     "PPLSoftWatermarker",
+    "LocalizedWatermarkDetection",
     "PhiloxPRF",
     "RotationFirstWatermarkDetector",
     "RotationFirstWatermarker",
     "RedGreenWatermarkDetector",
     "RedGreenWatermarker",
+    "SampledDraftWatermarker",
+    "SupportsDraftLaw",
+    "SupportsDraftLawVerification",
+    "SupportsResidualVerification",
     "SupportsSpeculativeDecoding",
     "SupportsVerificationLogits",
     "SynthIDWatermarkDetector",
     "SynthIDWatermarker",
     "TextGrainWatermarkDetector",
     "TextGrainWatermarker",
+    "TextSeal2SpeculativeWatermarker",
+    "TextSeal2VerificationWatermarker",
+    "TextSeal2WatermarkDetector",
+    "TextSeal2Watermarker",
     "UnigramWatermarkDetector",
     "UnigramWatermarker",
     "WatermarkDetection",

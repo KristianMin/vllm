@@ -5,12 +5,24 @@
 
 import math
 import warnings
+from collections.abc import Sequence
+from typing import Any
 
+import numpy as np
 import torch
 
 from vllm.config.watermarking import WatermarkPRFName, derive_watermark_key
 from vllm.v1.watermarking.detector import (
+    Context,
+    WatermarkDetection,
     WatermarkDetector,
+)
+from vllm.v1.watermarking.localized import (
+    LocalizedWatermarkDetection,
+    _dedup_window,
+    adaptive_ensemble_detection,
+    entropy_weights,
+    weighted_gamma_p,
 )
 from vllm.v1.watermarking.prfs import PhiloxPRF, WatermarkPRF, create_prf
 from vllm.v1.watermarking.watermarker import (
@@ -18,6 +30,12 @@ from vllm.v1.watermarking.watermarker import (
     SupportsSpeculativeDecoding,
     Watermarker,
     WatermarkSample,
+)
+from vllm.v1.watermarking.weighting import (
+    _WEIGHT_LEVELS,
+    WordStartWeights,
+    _weighted_tail,
+    surprisal_levels,
 )
 
 
@@ -208,6 +226,100 @@ class GumbelWatermarkDetector(WatermarkDetector):
         return token_scores.sum().item()
 
 
+class WeightedGumbelWatermarkDetector(GumbelWatermarkDetector):
+    """``GumbelWatermarkDetector`` with two weighted tests, which sum
+    ``w * -log(1 - U)`` with weights from 1 to 3.5 in steps of 0.25 and report
+    the tail of that sum for independent Exp(1) scores (saddlepoint
+    approximation): AutoMark's surprisal weights, given a detection model's
+    log-probabilities (``detect(token_ids, logprobs)``), or text-only weights,
+    ``word_start_weight`` for tokens that start a word or follow a sentence end
+    (``tokenizer`` required). Without either it is the plain test.
+    """
+
+    def __init__(
+        self,
+        key: int,
+        context_width: int = 4,
+        p_value_threshold: float = 0.01,
+        prf: WatermarkPRF | WatermarkPRFName = "philox",
+        deduplicate_contexts: bool = True,
+        tokenizer: Any = None,
+        word_start_weight: float = 1.0,
+    ) -> None:
+        super().__init__(
+            key, context_width, p_value_threshold, prf, deduplicate_contexts
+        )
+        self.word_starts = None
+        if word_start_weight != 1.0:
+            if tokenizer is None:
+                raise ValueError("word_start_weight needs the tokenizer")
+            self.word_starts = WordStartWeights(tokenizer, word_start_weight)
+
+    def detect(
+        self,
+        token_ids: list[int],
+        logprobs: Sequence[float | None] | None = None,
+    ) -> WatermarkDetection:
+        """Test generated ``token_ids``, excluding the prompt. With
+        ``logprobs``, ``logprobs[i]`` is a detection model's log-probability
+        of ``token_ids[i]`` (or None), and each score weighs ``1 + min(-logprob,
+        2.5)``, rounded to steps of 0.25."""
+        if logprobs is None and self.word_starts is None:
+            return super().detect(token_ids)
+        if logprobs is not None and self.word_starts is not None:
+            raise ValueError("logprobs and word_start_weight are exclusive")
+        if logprobs is not None and len(logprobs) != len(token_ids):
+            raise ValueError(
+                f"logprobs must hold one value per token, got {len(logprobs)} "
+                f"for {len(token_ids)} tokens"
+            )
+        positions = self._scored_positions(token_ids)
+        if not positions:
+            return WatermarkDetection(0.0, 1.0, 0, False)
+        contexts, targets = self._pairs(token_ids, positions)
+        if logprobs is not None:
+            levels = surprisal_levels([logprobs[p] for p in positions])
+        else:
+            assert self.word_starts is not None
+            levels = self.word_starts.levels(token_ids, positions)
+        scores = self._score_tokens(contexts, targets)
+        score = (_WEIGHT_LEVELS[levels] * scores).sum().item()
+        hist = torch.bincount(levels, minlength=len(_WEIGHT_LEVELS))
+        p_value = _weighted_tail(score, hist)
+        return WatermarkDetection(
+            score, p_value, len(positions), p_value <= self.p_value_threshold
+        )
+
+    def _scored_positions(self, token_ids: list[int]) -> list[int]:
+        """Positions ``_prepare_inputs`` scores: every token, its context
+        padded with -1 before the output, repeated contexts skipped when
+        ``deduplicate_contexts``."""
+        width = self.context_width
+        padded = [-1] * width + list(token_ids)
+        seen: set[tuple[int, ...]] = set()
+        positions = []
+        for position in range(len(token_ids)):
+            context = tuple(padded[position : position + width])
+            if self.deduplicate_contexts:
+                if context in seen:
+                    continue
+                seen.add(context)
+            positions.append(position)
+        return positions
+
+    def _pairs(
+        self, token_ids: list[int], positions: list[int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        width = self.context_width
+        padded = [-1] * width + list(token_ids)
+        return (
+            torch.tensor(
+                [padded[p : p + width] for p in positions], dtype=torch.int64
+            ).reshape(-1, width),
+            torch.tensor([token_ids[p] for p in positions], dtype=torch.int64),
+        )
+
+
 class DualKeyGumbelWatermarkDetector(GumbelWatermarkDetector):
     """Detect a dual-key watermark with weighted early fusion.
 
@@ -235,6 +347,87 @@ class DualKeyGumbelWatermarkDetector(GumbelWatermarkDetector):
         self.key_b_prf = create_prf(prf, derive_watermark_key(key, b"key_b"))
         self.alpha = alpha
 
+    @property
+    def _null_variance(self) -> float:
+        return (1 - self.alpha) ** 2 + self.alpha**2
+
+    def detect(
+        self, token_ids: list[int], entropies: Sequence[float] | None = None
+    ) -> WatermarkDetection:
+        """Detect the watermark in ``token_ids``.
+
+        With ``entropies``, where ``entropies[t]`` is the entropy of the
+        distribution token ``t`` was sampled from, this runs TextSeal's
+        entropy-weighted test (arXiv:2605.12456, Eq. 4-6) instead, which
+        weights each token's score by its entropy, min-max normalized within
+        the text.
+        """
+        if entropies is None:
+            return super().detect(token_ids)
+        entropy_array = _entropy_array(entropies, len(token_ids))
+        if not token_ids:
+            return WatermarkDetection(0.0, 1.0, 0, False)
+        scores, dedup_keys = self._position_scores(token_ids)
+        scores, scored_entropies = _dedup_window(
+            dedup_keys, scores, entropy_array, 0, len(scores)
+        )
+        assert scored_entropies is not None
+        weights = entropy_weights(scored_entropies)
+        p_value = weighted_gamma_p(scores, weights, self._null_variance)
+        return WatermarkDetection(
+            score=float(np.sum(weights * scores)),
+            p_value=p_value,
+            num_scored_tokens=len(scores),
+            is_watermarked=p_value <= self.p_value_threshold,
+        )
+
+    def detect_localized(
+        self,
+        token_ids: list[int],
+        entropies: Sequence[float] | None = None,
+        min_length: int = 50,
+        max_regions: int = 5,
+    ) -> LocalizedWatermarkDetection:
+        """Detect the watermark in all of ``token_ids`` or in parts of it.
+
+        Runs TextSeal's adaptive ensemble (arXiv:2605.12456, Sec. 3.3): the
+        global test, the best window of at least ``min_length`` tokens and a
+        union of up to ``max_regions`` windows, corrected for the windows and
+        tests tried. ``entropies`` adds the entropy-weighted tests.
+        """
+        weights = None
+        if entropies is not None:
+            weights = entropy_weights(_entropy_array(entropies, len(token_ids)))
+        if not token_ids:
+            return adaptive_ensemble_detection([])
+        scores, dedup_keys = self._position_scores(token_ids)
+        return adaptive_ensemble_detection(
+            scores,
+            p_value_threshold=self.p_value_threshold,
+            min_length=min_length,
+            max_regions=max_regions,
+            dedup_keys=dedup_keys,
+            weights=weights,
+            base_variance=self._null_variance,
+        )
+
+    def _position_scores(
+        self, token_ids: list[int]
+    ) -> tuple[np.ndarray, list[Context] | None]:
+        """Score every token, repeated contexts included. Return the scores
+        and, when contexts are deduplicated, each token's context as its
+        deduplication key."""
+        padded = [-1] * self.context_width + list(token_ids)
+        contexts = [
+            tuple(padded[position : position + self.context_width])
+            for position in range(len(token_ids))
+        ]
+        scores = self._score_tokens(
+            torch.tensor(contexts, dtype=torch.int64),
+            torch.tensor(token_ids, dtype=torch.int64),
+        )
+        return scores.numpy(), contexts if self.deduplicate_contexts else None
+
     def _score_tokens(
         self, contexts: torch.Tensor, targets: torch.Tensor
     ) -> torch.Tensor:
@@ -253,7 +446,7 @@ class DualKeyGumbelWatermarkDetector(GumbelWatermarkDetector):
         return scores @ weights
 
     def _get_p_value(self, score: float, num_scored_tokens: int) -> float:
-        variance = (1 - self.alpha) ** 2 + self.alpha**2
+        variance = self._null_variance
         if self.alpha in (0, 0.5, 1):
             return _gamma_survival_integer_shape(
                 score / variance, round(num_scored_tokens / variance)
@@ -261,6 +454,16 @@ class DualKeyGumbelWatermarkDetector(GumbelWatermarkDetector):
         shape = torch.tensor(num_scored_tokens / variance, dtype=torch.float64)
         scaled_score = torch.tensor(score / variance, dtype=torch.float64)
         return torch.special.gammaincc(shape, scaled_score).item()
+
+
+def _entropy_array(entropies: Sequence[float], num_tokens: int) -> np.ndarray:
+    entropy_array = np.asarray(entropies, dtype=np.float64)
+    if entropy_array.shape != (num_tokens,):
+        raise ValueError(
+            "entropies must hold one value per token, got shape "
+            f"{entropy_array.shape} for {num_tokens} tokens"
+        )
+    return entropy_array
 
 
 def _validate_context_width(context_width: int) -> None:

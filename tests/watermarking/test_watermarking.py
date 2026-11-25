@@ -1908,6 +1908,27 @@ def test_rotation_first_lexical_token_classes_group_case_and_space_variants():
     assert eligible.nonzero().flatten().tolist() == [0, 1, 2, 4, 5, 7]
 
 
+def test_rotation_first_lexical_letters_add_cyrillic_words():
+    class Tokenizer:
+        tokens = ["the", " Котка", "котка", "ок", "ѝма", "мачка!", "cat"]
+
+        def __len__(self) -> int:
+            return len(self.tokens)
+
+        def decode(self, token_ids: list[int]) -> str:
+            return self.tokens[token_ids[0]]
+
+    latin_classes, latin = lexical_token_classes(Tokenizer())
+    classes, eligible = lexical_token_classes(
+        Tokenizer(), lexical_letters="latin_cyrillic"
+    )
+
+    assert latin.nonzero().flatten().tolist() == [0, 6]
+    assert latin_classes.tolist() == list(range(7))
+    assert eligible.nonzero().flatten().tolist() == [0, 1, 2, 4, 6]
+    assert classes.tolist() == [0, 1, 1, 3, 4, 5, 6]
+
+
 def test_rotation_first_detector_scores_the_addresses_generation_keyed():
     watermarker = _rotation_first_watermarker()
     tokens, addresses = _generate_rotation_first(watermarker)
