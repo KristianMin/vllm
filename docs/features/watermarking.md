@@ -117,8 +117,9 @@ rejected before model loading. Set
 not watermarked, while target-side rejection recovery and bonus sampling remain
 watermarked. The watermark signal is diluted in proportion to the share of
 output tokens supplied by accepted drafts; rejected drafts do not dilute it
-because their recovery tokens are watermarked. The `red_green` is not diluted, as its
-verification uses the watermarked logits from the target model (see [Red-Green](#red-green-red-green-list)).
+because their recovery tokens are watermarked. `red_green`, `unigram`,
+`dipmark` and `morphmark` are not diluted, as their verification uses the
+watermarked logits from the target model (see [Red-Green](#red-green-red-green-list)).
 `multibit_red_green` and `synthid` are rejected even with
 `allow_target_only_watermarking`.
 `textgrain` verifies drafts against its watermarked distribution in the same
@@ -285,6 +286,91 @@ from vllm.v1.watermarking import UnigramWatermarkDetector
 
 result = UnigramWatermarkDetector(key=42, gamma=0.5).detect(token_ids)
 ```
+
+### DiPMark
+
+DiPMark ([Wu et al., 2023](https://arxiv.org/abs/2310.07710)) follows
+`DipmarkGenerator` of Meta's TextSeal, keyed with vLLM's PRF and contexts. The
+key and the prior token context order the vocabulary by descending PRF value
+`u`, ties going to the smaller token id. With `F` the cumulative distribution
+of the next-token law in that order, sampling draws from the law whose
+cumulative distribution is `max(F - alpha, 0) + max(F - (1 - alpha), 0)`: the
+probability mass in the first `alpha` of the order is removed and the mass in
+its last `alpha` is doubled, splitting the tokens that straddle a boundary.
+Averaged over the key's permutations, the reweighted law is the model's law.
+The reweighting runs after temperature scaling and top-k/top-p filtering,
+as in TextSeal, which reweights after top-p, and the ordinary random sampler
+draws from the result. `dipmark_alpha` (TextSeal's `alpha`) defaults to 0.2
+and must be in (0, 0.5]; a larger value gives a stronger watermark:
+
+```bash
+vllm serve MODEL \
+  --watermark-config '{"algorithm":"dipmark","key":42,"dipmark_alpha":0.2}'
+```
+
+TextSeal detects DiPMark with its green-list detector, and so does vLLM: a
+token is green when `u < gamma`, which makes the green tokens the last `gamma`
+share of the vocabulary in DiPMark's order, where the reweighting moves the
+mass. `gamma` does not change generation and defaults to TextSeal's 0.5. The
+detector is `RedGreenWatermarkDetector` with that default:
+
+```python
+from vllm.v1.watermarking import DiPMarkWatermarkDetector
+
+result = DiPMarkWatermarkDetector(key=42, gamma=0.5).detect(token_ids)
+```
+
+Speculative decoding works as for [Red-Green](#red-green-red-green-list), with
+`"allow_target_only_watermarking": true`: drafts are not watermarked and
+verification uses the reweighted target law, so every output token follows it.
+
+### MorphMark
+
+MorphMark ([Wang et al., 2025](https://arxiv.org/abs/2505.11541)) follows
+`MorphMarkGenerator` of Meta's TextSeal, keyed with vLLM's PRF and contexts.
+The green list holds the tokens whose PRF value is below `gamma` (default 0.5,
+TextSeal's value). With `P_G` the green tokens' share of the next-token law,
+the adaptive strength is `r = min(morphmark_k * P_G, 1 - 1e-6)` when `P_G`
+exceeds `morphmark_p0`, and `1e-6` otherwise, and a fraction `r` of the red mass
+moves to the green tokens: green probabilities are multiplied by
+`1 + r (1 - P_G) / P_G` and red ones by `1 - r`. TextSeal's code uses this
+linear strength `k * P_G`; the paper's `exp(k * P_G) - 1` is commented out
+there. `morphmark_k` defaults to 1.3 and `morphmark_p0` to 0.15. A law whose
+support is all green or all red is left unchanged:
+
+```bash
+vllm serve MODEL \
+  --watermark-config \
+  '{"algorithm":"morphmark","key":42,"morphmark_k":1.3,"morphmark_p0":0.15}'
+```
+
+As for every vLLM watermark, `P_G` and the reweighting are computed on the law
+after temperature scaling and top-k/top-p filtering. TextSeal computes `P_G`
+on the temperature-scaled law over the whole vocabulary and applies top-p
+after the reweighting, so the two differ when top-k or top-p truncates the law
+and coincide otherwise.
+
+The detector is `RedGreenWatermarkDetector` on MorphMark's green list, as in
+TextSeal:
+
+```python
+from vllm.v1.watermarking import MorphMarkWatermarkDetector
+
+result = MorphMarkWatermarkDetector(key=42, gamma=0.5).detect(token_ids)
+```
+
+Speculative decoding works as for [Red-Green](#red-green-red-green-list), with
+`"allow_target_only_watermarking": true`.
+
+DiPMark and MorphMark also differ from TextSeal's code in their keyed
+randomness (vLLM's Philox PRF over the last `context_width` tokens instead of
+TextSeal's 13-bit hash of the last `ngram` tokens, so neither detector reads
+the other's text), in context deduplication (vLLM samples repeated contexts
+without the watermark by default and its detector scores each context once;
+TextSeal reuses repeated windows by default and scores each distinct window
+and token pair once), and in the p-value (the exact binomial tail
+`P(X >= score)`; TextSeal reports the mid-p value, which subtracts half of
+`P(X = score)`).
 
 ### Multi-bit red-green
 

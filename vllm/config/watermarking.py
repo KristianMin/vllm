@@ -17,6 +17,8 @@ WatermarkingAlgorithm = Literal[
     "dual_key_gumbel",
     "red_green",
     "unigram",
+    "dipmark",
+    "morphmark",
     "multibit_red_green",
     "lookahead_gumbel",
     "lookahead_dual_key_gumbel",
@@ -68,7 +70,8 @@ class WatermarkConfig:
     algorithm: WatermarkingAlgorithm = "gumbel"
     """Algorithm used to watermark generated text."""
     alpha: float = Field(default=0.1, ge=0, le=1)
-    """Probability of selecting key B for dual-key watermarking."""
+    """Probability of selecting key B for dual-key watermarking (`dipmark`'s
+    interval parameter is `dipmark_alpha`)."""
     correlation: float | None = Field(default=None, gt=0, le=1)
     """Keyed share of the Gaussian behind the Gumbel noise of the Gaussian
     copula watermarks; 1 makes the noise fully keyed. Each algorithm has its
@@ -82,8 +85,27 @@ class WatermarkConfig:
     `multibit_red_green` (0.5), and how strongly `chi_squared` favors tokens
     with high watermark scores (1.0)."""
     gamma: float | None = Field(default=None, gt=0, lt=1)
-    """Fraction of the vocabulary in each green list, whose default depends on
-    the algorithm: 0.25 for `red_green` and 0.5 for `unigram`."""
+    """Fraction of the vocabulary in each green list (the tokens whose PRF
+    value is below `gamma`), whose default depends on the algorithm: 0.25 for
+    `red_green` and 0.5 for `unigram`, `dipmark` and `morphmark` (TextSeal's
+    value). `dipmark` generation does not depend on it: it is the green-list
+    fraction its detector counts, the end of DiPMark's keyed permutation."""
+    dipmark_alpha: float = Field(default=0.2, gt=0, le=0.5)
+    """Interval parameter of `dipmark` (TextSeal's `alpha`, default 0.2): the
+    reweighting removes the first `dipmark_alpha` of the cumulative
+    probability in the keyed permutation and doubles the last `dipmark_alpha`.
+    Larger values give a stronger watermark; the law is unchanged on average
+    over keys for every value. Values above 0.5 are equivalent to
+    `1 - dipmark_alpha` and are rejected."""
+    morphmark_k: float = Field(default=1.3, gt=0)
+    """Slope of `morphmark`'s adaptive strength (TextSeal's `k_morphmark`,
+    default 1.3): when the green mass `P_G` of the next-token law exceeds
+    `morphmark_p0`, a fraction `r = min(morphmark_k * P_G, 1 - 1e-6)` of the
+    red mass moves to the green tokens."""
+    morphmark_p0: float = Field(default=0.15, ge=0, lt=1)
+    """Green-mass threshold of `morphmark` (TextSeal's `p_0`, default 0.15):
+    at or below it the strength is 1e-6, which leaves the law unchanged up to
+    a total variation of 1e-6."""
     message: int = Field(default=0, ge=0)
     """Message embedded by multi-bit red-green watermarking, as an unsigned
     integer of `message_bits` bits."""

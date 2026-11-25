@@ -77,6 +77,8 @@ Set `algorithm` in the watermark config; `gumbel` is the default. Every algorith
 | `lookahead_gumbel` | Gumbel-max that keeps every emitted token watermarked under speculative decoding | `aggregator` `tsum` | `GumbelWatermarkDetector` | |
 | `red_green` | Raises the logits of a keyed green list by `delta` ([Kirchenbauer et al., 2023](https://arxiv.org/abs/2301.10226)) | `delta` 2.0, `gamma` 0.25 | `RedGreenWatermarkDetector` | `gamma` |
 | `unigram` | Red-green with one green list for every position, without context ([Zhao et al., 2023](https://arxiv.org/abs/2306.17439)) | `delta` 2.0, `gamma` 0.5 | `UnigramWatermarkDetector` | `gamma` (no `context_width`) |
+| `dipmark` | Moves the first `dipmark_alpha` of the probability mass, in a keyed order of the vocabulary, to its last `dipmark_alpha`; unbiased over keys ([Wu et al., 2023](https://arxiv.org/abs/2310.07710), as in Meta's TextSeal) | `dipmark_alpha` 0.2 | `DiPMarkWatermarkDetector` (red-green test) | `gamma` (0.5) |
+| `morphmark` | Moves a share `min(morphmark_k * P_G, 1 - 1e-6)` of the red mass to a keyed green list when its mass `P_G` exceeds `morphmark_p0` ([Wang et al., 2025](https://arxiv.org/abs/2505.11541), as in Meta's TextSeal) | `morphmark_k` 1.3, `morphmark_p0` 0.15, `gamma` 0.5 | `MorphMarkWatermarkDetector` (red-green test) | `gamma` |
 | `multibit_red_green` | Red-green that embeds a `message_bits`-bit integer `message` | `delta` 0.5, `message_bits` 16 | `MultibitRedGreenWatermarkDetector`, which also decodes the message | `message_bits` |
 | `chi_squared` | Samples p·w, with weights w from keyed binomial scores ([Gloaguen et al., 2026](https://arxiv.org/abs/2602.06754)) | `delta` 1.0 | `BinomialScoreWatermarkDetector` | |
 | `ppl_hard` | Highest expected score within a perplexity budget of `epsilon` nats per token (same paper) | `epsilon` 0 | `BinomialScoreWatermarkDetector` | |
@@ -90,7 +92,7 @@ All detectors are in `vllm.v1.watermarking`.
 ## Speculative decoding
 
 - `dual_key_gumbel`, `lookahead_gumbel` and `textgrain` support speculative decoding.
-- `gumbel`, `red_green` and `unigram` need `"allow_target_only_watermarking": true`, which leaves draft tokens unwatermarked. For `gumbel`, that weakens the watermark in proportion to the share of accepted drafts. `red_green` and `unigram` verify drafts against their watermarked logits, so they keep their full strength at a lower acceptance rate.
+- `gumbel`, `red_green`, `unigram`, `dipmark` and `morphmark` need `"allow_target_only_watermarking": true`, which leaves draft tokens unwatermarked. For `gumbel`, that weakens the watermark in proportion to the share of accepted drafts. `red_green`, `unigram`, `dipmark` and `morphmark` verify drafts against their watermarked logits, so they keep their full strength at a lower acceptance rate.
 - `multibit_red_green`, `chi_squared`, `ppl_hard`, `ppl_soft`, `synthid` and `gaussian_copula` don't support it.
 
 The drafter must be an autoregressive model (`dspark`, `draft_model`, `eagle`, `eagle3` or `mtp`) with `"draft_sample_method": "probabilistic"`. The [guide](https://github.com/KristianMin/vllm/blob/watermark-all/docs/features/watermarking.md#speculative-decoding) has the details.
@@ -105,6 +107,7 @@ The drafter must be an autoregressive model (`dspark`, `draft_model`, `eagle`, `
 ## Differences from the papers' code
 
 - All algorithms use vLLM's Philox function for their keyed randomness, and vLLM applies temperature, top-k and top-p before the watermark. The papers' implementations generate their randomness differently, so their detectors can't detect this fork's text, and the other way around. Philox is not cryptographic.
+- `morphmark` computes its green mass on the law after top-k and top-p and reweights within it; TextSeal computes it on the whole temperature-scaled law and applies top-p after the reweighting. `dipmark` reweights after top-p in both. Both detectors report the exact binomial tail, not TextSeal's mid-p value.
 - `chi_squared` samples p·w, the distribution of the paper's Theorem D.6. The reference code also applies the temperature to w, so the two differ when the temperature isn't 1.
 - `ppl_soft` draws its scores for the 4096 most probable tokens only, and selects among those.
 - `chi_squared`, the two perplexity watermarks and `gaussian_copula` leave an output's first `context_width` tokens unwatermarked, as their references do. `textgrain` watermarks them with a padded context, as vLLM's Gumbel-max does.
