@@ -9,6 +9,7 @@ from vllm.v1.watermarking.block_verified_gumbel import (
     BlockVerifiedGumbelWatermarker,
     FusedTwoKeyGumbelWatermarkDetector,
     FusedWatermarkDetection,
+    FreshNoiseDraftWatermarker,
     SampledDraftWatermarker,
 )
 from vllm.v1.watermarking.chi_squared import ChiSquaredWatermarker
@@ -68,10 +69,19 @@ from vllm.v1.watermarking.textgrain import (
     TextGrainWatermarker,
 )
 from vllm.v1.watermarking.textseal2 import (
+    TextSeal2DraftLawDraftWatermarker,
+    TextSeal2DraftLawVerificationWatermarker,
     TextSeal2SpeculativeWatermarker,
     TextSeal2VerificationWatermarker,
     TextSeal2WatermarkDetector,
     TextSeal2Watermarker,
+)
+from vllm.v1.watermarking.two_key_block import (
+    FusedTwoKeyWatermarkDetector,
+    TwoKeyBlockDraftWatermarker,
+    TwoKeyBlockVerificationWatermarker,
+    TwoKeyBlockWatermarker,
+    TwoKeyDetection,
 )
 from vllm.v1.watermarking.watermarker import (
     SupportsDraftLaw,
@@ -117,6 +127,7 @@ __all__ = [
     "RotationFirstWatermarker",
     "RedGreenWatermarkDetector",
     "RedGreenWatermarker",
+    "FreshNoiseDraftWatermarker",
     "SampledDraftWatermarker",
     "SupportsDraftLaw",
     "SupportsDraftLawVerification",
@@ -127,7 +138,14 @@ __all__ = [
     "SynthIDWatermarker",
     "TextGrainWatermarkDetector",
     "TextGrainWatermarker",
+    "TextSeal2DraftLawDraftWatermarker",
+    "TextSeal2DraftLawVerificationWatermarker",
     "TextSeal2SpeculativeWatermarker",
+    "FusedTwoKeyWatermarkDetector",
+    "TwoKeyBlockDraftWatermarker",
+    "TwoKeyBlockVerificationWatermarker",
+    "TwoKeyBlockWatermarker",
+    "TwoKeyDetection",
     "TextSeal2VerificationWatermarker",
     "TextSeal2WatermarkDetector",
     "TextSeal2Watermarker",

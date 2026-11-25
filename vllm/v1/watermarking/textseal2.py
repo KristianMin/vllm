@@ -61,13 +61,23 @@ from vllm.v1.watermarking.localized import (
     entropy_weights,
     weighted_gamma_p,
 )
+from vllm.v1.watermarking.block_verified_gumbel import (
+    DRAFT_LAW_WIDTH,
+    FreshNoiseDraftWatermarker,
+    SampledDraftWatermarker,
+    draft_law_logits,
+)
 from vllm.v1.watermarking.prfs import PhiloxPRF, WatermarkPRF, create_prf
 from vllm.v1.watermarking.textseal2_verification import (
+    FRESH_DECISIONS,
     LAWS,
     PASS_AGGREGATORS,
     PASS_SOURCES,
+    SAMPLED_DRAFT_DECISIONS,
+    SPEC_DECISIONS,
+    TOKEN_DECISIONS,
+    decide,
     race,
-    residual_race,
 )
 from vllm.v1.watermarking.watermarker import (
     RandomSampler,
@@ -86,6 +96,11 @@ _VERIFICATION_NOISE_SEED = 0x54535332_56455249
 # Philox key of the noise a draft race shares with its verification. Public:
 # the noise needs no secrecy, only independence from keys A and B.
 _RESIDUAL_NOISE_PRF = PhiloxPRF(0x54535332_52455344)
+# Public Philox keys of the fresh randomness of the reference's other
+# decisions (``spec_decision``), on the rows' (seed, position, step)
+# contexts: two uniforms per row, and fresh Exp(1) clocks.
+_DECISION_PRF = PhiloxPRF(0x54535332_44454349)
+_FRESH_CLOCK_PRF = PhiloxPRF(0x54535332_46524553)
 # Elements of each float64 [rows, vocab] tensor of the speculative rule.
 _CHUNK_ELEMENTS = 1 << 24
 
@@ -159,6 +174,23 @@ def residual_noise(
     vocabulary = torch.arange(vocab_size, device=contexts.device)
     return torch.special.ndtri(
         _RESIDUAL_NOISE_PRF.uniform(contexts, vocabulary).double()
+    )
+
+
+def round_contexts(
+    seeds: torch.Tensor, positions: torch.Tensor, steps: torch.Tensor
+) -> torch.Tensor:
+    """[rows, 4] PRF contexts of each row's round: the request seed's two
+    words, the row's position and its draft step (``residual_noise``'s)."""
+    seeds = seeds.long()
+    return torch.stack(
+        [
+            seeds & 0xFFFFFFFF,
+            (seeds >> 32) & 0xFFFFFFFF,
+            positions.long().expand_as(seeds),
+            steps.long().expand_as(seeds),
+        ],
+        dim=-1,
     )
 
 
@@ -385,20 +417,24 @@ class TextSeal2VerificationWatermarker(TextSeal2Watermarker):
     """The verifier's side of TextSeal2's speculative rule; without
     speculation it samples like ``TextSeal2Watermarker``.
 
-    ``residual_verification_logits`` runs the residual race on the keyed drafts
-    of ``TextSeal2DraftWatermarker``, with the drafts' distributions and the
-    shared noise. ``verification_logits`` runs it on unwatermarked drafts as
-    point masses, on raw clocks with fresh noise from a generator the
-    watermarker owns (the reference's unkeyed-draft mode, exact only for drafts
-    that do not depend on the key). ``law`` is the verification law the race
-    follows, ``pass_aggregator`` and ``pass_source`` TextSeal2's lookahead on
-    it (``textseal2_verification``).
+    ``residual_verification_logits`` decides the rounds of the keyed drafts of
+    ``TextSeal2DraftWatermarker``, with the drafts' distributions and the
+    shared noise. ``verification_logits`` runs the residual race on
+    unwatermarked drafts as point masses, on raw clocks with fresh noise from
+    a generator the watermarker owns (the reference's unkeyed-draft mode,
+    exact only for drafts that do not depend on the key). ``law`` is the
+    verification law, ``spec_decision`` the reference's decision rule
+    (``textseal2_verification.decide``: ``residual_j`` the paper's residual
+    race, with ``pass_aggregator`` and ``pass_source`` TextSeal2's lookahead
+    on it; ``j_only`` verifies drafts sampled from the draft distribution on
+    fresh noise, ``FreshNoiseDraftWatermarker``). Their fresh randomness is a
+    public PRF of each row's request seed, position and draft step.
 
-    A request is decided by the race when one of its rows is watermarked and
+    A request is decided by the rule when one of its rows is watermarked and
     every draft is a valid token; its rows without a full context or in
     ``skip_mask`` race on the noise alone, as the drafter raced them. The other
     requests keep their logits. As for the lookahead watermarks,
-    ``context_width`` should be at least the number of drafts: the race reads
+    ``context_width`` should be at least the number of drafts: the rule reads
     the clocks of rows it then discards.
     """
 
@@ -412,6 +448,7 @@ class TextSeal2VerificationWatermarker(TextSeal2Watermarker):
         law: str = "block",
         pass_aggregator: str = "none",
         pass_source: str = "own",
+        spec_decision: str = "residual_j",
     ) -> None:
         super().__init__(key, context_width, prf, correlation)
         if law not in LAWS:
@@ -420,12 +457,14 @@ class TextSeal2VerificationWatermarker(TextSeal2Watermarker):
             raise ValueError(f"pass_aggregator must be one of {PASS_AGGREGATORS}")
         if pass_source not in PASS_SOURCES:
             raise ValueError(f"pass_source must be one of {PASS_SOURCES}")
+        validate_spec_decision(spec_decision, law, pass_aggregator, keyed_drafts)
         self.keyed_drafts = keyed_drafts
-        # Unwatermarked drafts need no draft watermarker.
+        # Unwatermarked drafts need no draft watermarker (j_only's do).
         self.verifies_unwatermarked_drafts = not keyed_drafts
         self.law = law
         self.pass_aggregator = pass_aggregator
         self.pass_source = pass_source
+        self.spec_decision = spec_decision
         self._verification_generators: dict[torch.device, torch.Generator] = {}
 
     def verification_logits(
@@ -436,6 +475,11 @@ class TextSeal2VerificationWatermarker(TextSeal2Watermarker):
         cu_num_logits: torch.Tensor,
         skip_mask: torch.Tensor,
     ) -> torch.Tensor:
+        if self.spec_decision != "residual_j":
+            raise ValueError(
+                f"spec_decision={self.spec_decision!r} needs probabilistic drafts"
+            )
+
         def noise(rows: slice, vocab_size: int) -> torch.Tensor:
             shape = torch.Size([rows.stop - rows.start, vocab_size])
             return _fresh_normals(
@@ -449,6 +493,25 @@ class TextSeal2VerificationWatermarker(TextSeal2Watermarker):
             logits, contexts, draft_tokens, cu_num_logits, skip_mask, None, noise
         )
 
+    def _round_noise(
+        self, cu_num_logits: torch.Tensor, num_rows: int, random_sampler: RandomSampler
+    ):
+        """(noise(rows, vocab), round contexts [num_rows, 4]) of the shared
+        noise of the draft races and the rule's fresh randomness."""
+        device = cu_num_logits.device
+        requests = random_sampler.expanded_idx_mapping.long().clamp_min(0)
+        bounds = cu_num_logits.long()
+        starts = bounds[:-1].repeat_interleave(bounds.diff())
+        steps = torch.arange(num_rows, device=device) - starts
+        seeds = random_sampler.seeds[requests]
+
+        def noise(rows: slice, vocab_size: int) -> torch.Tensor:
+            return residual_noise(
+                seeds[rows], random_sampler.positions[rows], steps[rows], vocab_size
+            )
+
+        return noise, round_contexts(seeds, random_sampler.positions, steps)
+
     def residual_verification_logits(
         self,
         logits: torch.Tensor,
@@ -459,23 +522,11 @@ class TextSeal2VerificationWatermarker(TextSeal2Watermarker):
         draft_logits: torch.Tensor,
         random_sampler: RandomSampler,
     ) -> torch.Tensor:
-        if not self.keyed_drafts:
+        if not self.keyed_drafts and self.spec_decision != "j_only":
             return self.verification_logits(
                 logits, contexts, draft_tokens, cu_num_logits, skip_mask
             )
-        requests = random_sampler.expanded_idx_mapping.long().clamp_min(0)
-        bounds = cu_num_logits.long()
-        starts = bounds[:-1].repeat_interleave(bounds.diff())
-        steps = torch.arange(logits.shape[0], device=logits.device) - starts
-
-        def noise(rows: slice, vocab_size: int) -> torch.Tensor:
-            return residual_noise(
-                random_sampler.seeds[requests[rows]],
-                random_sampler.positions[rows],
-                steps[rows],
-                vocab_size,
-            )
-
+        noise, fresh = self._round_noise(cu_num_logits, logits.shape[0], random_sampler)
         return self._residual_logits(
             logits,
             contexts,
@@ -484,6 +535,7 @@ class TextSeal2VerificationWatermarker(TextSeal2Watermarker):
             skip_mask,
             draft_logits,
             noise,
+            fresh,
         )
 
     def _residual_logits(
@@ -495,7 +547,15 @@ class TextSeal2VerificationWatermarker(TextSeal2Watermarker):
         skip_mask: torch.Tensor,
         draft_logits: torch.Tensor | None,
         noise,
+        fresh: torch.Tensor | None = None,
+        decided_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Point masses of the decided requests, the others' logits.
+        ``decided_rows`` (row-level, the draft-law path: the watermarked
+        requests' rows) decides those requests whatever their drafts, ending
+        a request's round at its first invalid draft; by default a request is
+        decided when one of its rows is not in ``skip_mask`` and every draft
+        is valid."""
         num_rows, vocab_size = logits.shape
         if num_rows == 0:
             return logits
@@ -509,6 +569,30 @@ class TextSeal2VerificationWatermarker(TextSeal2Watermarker):
         output = logits.clone()
         for first, end in _request_chunks(sizes, vocab_size):
             rows = slice(bounds[first], bounds[end])
+            num_requests = end - first
+            request = torch.repeat_interleave(
+                torch.arange(num_requests, device=device),
+                torch.tensor(sizes[first:end], device=device),
+            )
+            local = torch.arange(rows.stop - rows.start, device=device) - torch.tensor(
+                bounds[first:end], device=device
+            ).sub(bounds[first])[request]
+            counts = torch.zeros(2, num_requests, dtype=torch.long, device=device)
+            num_drafts = None
+            if decided_rows is None:
+                counts[0].index_add_(0, request, (~skip_mask[rows]).long())
+                counts[1].index_add_(0, request, (~valid_draft[rows]).long())
+                raced = ((counts[0] > 0) & (counts[1] == 0))[request]
+            else:
+                counts[0].index_add_(0, request, decided_rows[rows].long())
+                raced = (counts[0] > 0)[request]
+                # The round ends at the first invalid draft (its bonus row).
+                invalid_at = torch.where(
+                    valid_draft[rows], torch.iinfo(torch.long).max, local
+                )
+                num_drafts = torch.full(
+                    (num_requests,), torch.iinfo(torch.long).max, device=device
+                ).scatter_reduce(0, request, invalid_at, reduce="amin")
             tokens = self._decide(
                 logits[rows],
                 contexts[rows],
@@ -517,16 +601,9 @@ class TextSeal2VerificationWatermarker(TextSeal2Watermarker):
                 None if draft_logits is None else draft_logits[rows],
                 noise(rows, vocab_size),
                 sizes[first:end],
+                None if fresh is None else fresh[rows],
+                num_drafts,
             )
-            request = torch.repeat_interleave(
-                torch.arange(end - first, device=device),
-                torch.tensor(sizes[first:end], device=device),
-            )
-            # Raced: a row is watermarked and every draft is valid.
-            counts = torch.zeros(2, end - first, dtype=torch.long, device=device)
-            counts[0].index_add_(0, request, (~skip_mask[rows]).long())
-            counts[1].index_add_(0, request, (~valid_draft[rows]).long())
-            raced = ((counts[0] > 0) & (counts[1] == 0))[request]
             point_masses = torch.full_like(logits[rows], float("-inf")).scatter_(
                 1, tokens.unsqueeze(1), 0.0
             )
@@ -542,10 +619,15 @@ class TextSeal2VerificationWatermarker(TextSeal2Watermarker):
         draft_logits: torch.Tensor | None,
         noise: torch.Tensor,
         sizes: list[int],
+        fresh: torch.Tensor | None = None,
+        num_drafts: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Each row's point mass for whole requests (rows in path order): its
         draft below the stopping row, the emitted token at it, and above it its
-        draft, or at the bonus row its own race's winner."""
+        draft, or at the bonus row its own race's winner. ``num_drafts``
+        [requests] caps each request's drafts (rows past its bonus row are
+        padding); ``fresh`` [rows, 4] are the rows' round contexts of the
+        rule's fresh randomness."""
         num_rows, vocab_size = logits.shape
         device = logits.device
         vocabulary = torch.arange(vocab_size, device=device)
@@ -563,6 +645,8 @@ class TextSeal2VerificationWatermarker(TextSeal2Watermarker):
         starts = torch.cumsum(sizes_t, 0) - sizes_t
         local = torch.arange(num_rows, device=device) - starts[request]
         K = sizes_t - 1
+        if num_drafts is not None:
+            K = torch.minimum(K, num_drafts)
         is_draft = local < K[request]
         drafts = torch.where(is_draft, draft_tokens, 0).clamp(0, vocab_size - 1)
         if draft_logits is None:
@@ -575,10 +659,22 @@ class TextSeal2VerificationWatermarker(TextSeal2Watermarker):
         Q = Q * is_draft.unsqueeze(1)
 
         slots = torch.full((num_requests, depth), -1, dtype=torch.long, device=device)
-        slots[request, local] = torch.arange(num_rows, device=device)
+        in_round = local <= K[request]
+        slots[request[in_round], local[in_round]] = torch.arange(num_rows, device=device)[
+            in_round
+        ]
         pad = (slots < 0).unsqueeze(2)
         index = slots.clamp_min(0)
-        stopping, col = residual_race(
+        u = F = None
+        if self.spec_decision in FRESH_DECISIONS:
+            assert fresh is not None, "the rule's fresh randomness needs round contexts"
+            u = _DECISION_PRF.uniform(fresh, torch.arange(2, device=device)).double()
+            u = u[index]
+            if self.spec_decision == "agreement":
+                F = -torch.log(_FRESH_CLOCK_PRF.uniform(fresh, vocabulary).double())
+                F = F[index].masked_fill(pad, 1.0)
+        stopping, col = decide(
+            self.spec_decision,
             E[index].masked_fill(pad, 1.0),
             P[index].masked_fill(pad, 0.0),
             Q[index].masked_fill(pad, 0.0),
@@ -587,18 +683,143 @@ class TextSeal2VerificationWatermarker(TextSeal2Watermarker):
             self.law,
             self.pass_aggregator,
             self.pass_source,
+            keyed=keyed[index] & ~pad.squeeze(2),
+            u=u,
+            F=F,
         )
         tokens = torch.where(is_draft, drafts, race(E, P))
         return torch.where(local == stopping[request], col[request], tokens)
+
+
+class TextSeal2DraftLawDraftWatermarker(TextSeal2DraftWatermarker):
+    """``TextSeal2DraftWatermarker`` on the draft law: the drafts race on the
+    drafter's distribution truncated like the target (temperature, then the
+    request's min-p, top-k and top-p; ``block_verified_gumbel.draft_law_logits``),
+    as the reference drafts (``truncate_drafts``)."""
+
+    def __init__(
+        self,
+        key: int,
+        context_width: int = 4,
+        prf: WatermarkPRFName = "philox",
+        correlation: float = DEFAULT_CORRELATION,
+        draft_law_width: int = DRAFT_LAW_WIDTH,
+    ) -> None:
+        super().__init__(key, context_width, prf, correlation)
+        if draft_law_width < 1:
+            raise ValueError("draft_law_width must be positive")
+        self.draft_law_width = draft_law_width
+
+    def draft_law_logits(
+        self,
+        logits: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        min_p: torch.Tensor,
+    ) -> torch.Tensor:
+        return draft_law_logits(logits, top_k, top_p, min_p, self.draft_law_width)
+
+
+class TextSeal2DraftLawVerificationWatermarker(TextSeal2VerificationWatermarker):
+    """``TextSeal2VerificationWatermarker`` for drafts on the draft law
+    (``TextSeal2DraftLawDraftWatermarker``, or ``SampledDraftWatermarker`` for
+    ``j_only``): every watermarked request's round is decided by the rule,
+    its repeated rows on the noise alone, a round ending at its first invalid
+    draft. The other requests keep their logits and vLLM's rejection
+    sampling, with temperature-only drafts."""
+
+    def __init__(
+        self,
+        key: int,
+        context_width: int = 4,
+        prf: WatermarkPRFName = "philox",
+        correlation: float = DEFAULT_CORRELATION,
+        keyed_drafts: bool = True,
+        law: str = "block",
+        pass_aggregator: str = "none",
+        pass_source: str = "own",
+        spec_decision: str = "residual_j",
+        draft_law_width: int = DRAFT_LAW_WIDTH,
+    ) -> None:
+        super().__init__(
+            key,
+            context_width,
+            prf,
+            correlation,
+            keyed_drafts,
+            law,
+            pass_aggregator,
+            pass_source,
+            spec_decision,
+        )
+        if not keyed_drafts and spec_decision != "j_only":
+            raise ValueError("the draft law needs keyed drafts or j_only")
+        if draft_law_width < 1:
+            raise ValueError("draft_law_width must be positive")
+        self.draft_law_width = draft_law_width
+
+    def draft_law_logits(
+        self,
+        logits: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        min_p: torch.Tensor,
+    ) -> torch.Tensor:
+        return draft_law_logits(logits, top_k, top_p, min_p, self.draft_law_width)
+
+    def draft_law_verification_logits(
+        self,
+        logits: torch.Tensor,
+        contexts: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+        request_enabled: torch.Tensor,
+        repeated: torch.Tensor,
+        draft_law: torch.Tensor,
+        random_sampler: RandomSampler,
+    ) -> torch.Tensor:
+        noise, fresh = self._round_noise(cu_num_logits, logits.shape[0], random_sampler)
+        return self._residual_logits(
+            logits,
+            contexts,
+            draft_tokens,
+            cu_num_logits,
+            ~request_enabled | repeated,
+            draft_law,
+            noise,
+            fresh,
+            decided_rows=request_enabled,
+        )
+
+
+def validate_spec_decision(
+    spec_decision: str, law: str, pass_aggregator: str, keyed_drafts: bool
+) -> None:
+    """The combinations of the reference's decisions with the verification
+    law, the lookahead and the drafts."""
+    if spec_decision not in SPEC_DECISIONS:
+        raise ValueError(f"spec_decision must be one of {SPEC_DECISIONS}")
+    if law == "token" and spec_decision not in TOKEN_DECISIONS:
+        raise ValueError(
+            f"token-level verification supports spec_decision in {TOKEN_DECISIONS}"
+        )
+    if spec_decision != "residual_j" and pass_aggregator != "none":
+        raise ValueError("pass_aggregator applies to spec_decision='residual_j' only")
+    if spec_decision in SAMPLED_DRAFT_DECISIONS and keyed_drafts:
+        raise ValueError(f"spec_decision={spec_decision!r} needs keyed_drafts=False")
+    if spec_decision not in ("residual_j",) + SAMPLED_DRAFT_DECISIONS and not keyed_drafts:
+        raise ValueError(f"spec_decision={spec_decision!r} needs keyed drafts")
 
 
 class TextSeal2SpeculativeWatermarker(
     TextSeal2Watermarker, SupportsSpeculativeDecoding
 ):
     """TextSeal2 with the paper's speculative rule: the drafter races the
-    drafts on the key (``draft_watermarker``) and verification runs the
-    residual race (``target_watermarker``). Without speculation it samples like
-    ``TextSeal2Watermarker``."""
+    drafts on the key (``draft_watermarker``) and verification decides the
+    round (``target_watermarker``); ``spec_decision`` selects the reference's
+    decision rule, ``truncate_drafts`` drafts on the draft law. With
+    ``j_only`` the drafts are sampled on fresh noise instead. Without
+    speculation it samples like ``TextSeal2Watermarker``."""
 
     def __init__(
         self,
@@ -609,21 +830,41 @@ class TextSeal2SpeculativeWatermarker(
         law: str = "block",
         pass_aggregator: str = "none",
         pass_source: str = "own",
+        spec_decision: str = "residual_j",
+        truncate_drafts: bool = False,
+        draft_law_width: int = DRAFT_LAW_WIDTH,
     ) -> None:
         super().__init__(key, context_width, prf, correlation)
-        self.draft_watermarker = TextSeal2DraftWatermarker(
-            key, context_width, prf, correlation
-        )
-        self.target_watermarker = TextSeal2VerificationWatermarker(
-            key,
-            context_width,
-            prf,
-            correlation,
-            keyed_drafts=True,
+        sampled = spec_decision in SAMPLED_DRAFT_DECISIONS
+        rule = dict(
+            keyed_drafts=not sampled,
             law=law,
             pass_aggregator=pass_aggregator,
             pass_source=pass_source,
+            spec_decision=spec_decision,
         )
+        self.draft_watermarker: Watermarker
+        if truncate_drafts:
+            self.draft_watermarker = (
+                SampledDraftWatermarker(context_width, draft_law_width)
+                if sampled
+                else TextSeal2DraftLawDraftWatermarker(
+                    key, context_width, prf, correlation, draft_law_width
+                )
+            )
+            self.target_watermarker = TextSeal2DraftLawVerificationWatermarker(
+                key, context_width, prf, correlation, **rule,
+                draft_law_width=draft_law_width,
+            )
+        else:
+            self.draft_watermarker = (
+                FreshNoiseDraftWatermarker(context_width)
+                if sampled
+                else TextSeal2DraftWatermarker(key, context_width, prf, correlation)
+            )
+            self.target_watermarker = TextSeal2VerificationWatermarker(
+                key, context_width, prf, correlation, **rule
+            )
 
 
 class TextSeal2WatermarkDetector(WatermarkDetector):

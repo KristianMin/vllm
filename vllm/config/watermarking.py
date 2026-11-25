@@ -49,7 +49,14 @@ RotationFirstLexicalLetters = Literal["latin", "latin_cyrillic"]
 WatermarkContextScope = Literal["none", "single_turn", "all", "strict"]
 # Algorithms whose speculative verification implements deduplicate_contexts
 # "strict" (contexts evaluated in earlier verification steps are repeated too).
-STRICT_DEDUPLICATION_ALGORITHMS = ("lookahead_gumbel", "block_verified_gumbel")
+STRICT_DEDUPLICATION_ALGORITHMS = (
+    "lookahead_gumbel",
+    "block_verified_gumbel",
+    "textseal2",
+)
+# The algorithms with the TextSeal2 reference's speculative baseline
+# (`two_key_block_verification`, which also allows strict deduplication).
+TWO_KEY_BLOCK_ALGORITHMS = ("dual_key_gumbel", "gaussian_copula", "textgrain", "synthid")
 
 _MIN_RECOMMENDED_DEDUP_HISTORY = 1024
 
@@ -153,6 +160,40 @@ class WatermarkConfig:
     pass_source: Literal["own", "child"] = "own"
     """Whose draft race time `pass_aggregator` mixes into a row's pass clock:
     the row's own draft's (`own`) or the next draft's (`child`)."""
+    spec_decision: Literal[
+        "residual_j", "fresh_stop", "tau_stop", "agreement", "j_only", "raw_j"
+    ] = "residual_j"
+    """`textseal2` under speculative decoding: the decision rule of a round,
+    from the TextSeal2 reference implementation (its `spec_decision`).
+    `residual_j` is the paper's residual race. Block verification also has
+    `fresh_stop` (the stopping row from fresh randomness, the token from the
+    leftover race there), `tau_stop` (the stopping row from the draft races'
+    times), `agreement` (plain decoding on the drafts' clocks, corrected to
+    block verification's law), `j_only` (drafts sampled without the key, the
+    race on the raw clocks; needs `keyed_drafts=false`) and `raw_j` (keyed
+    drafts, the race on the raw clocks: the reference's biased negative
+    control). Token-level verification has `residual_j`, `fresh_stop` (the
+    reference's token rule `residual`) and `agreement` (its race coupling).
+    `pass_aggregator` applies to `residual_j` only."""
+    two_key_block_verification: bool = False
+    """The TextSeal2 reference implementation's speculative baseline for
+    `dual_key_gumbel` (its `textseal`), `gaussian_copula` (`automark`),
+    `textgrain` and `synthid`: each draft is the scheme's watermarked sample
+    of the draft law (truncated like the target) under key A
+    (`dual_key_gumbel`: key B with probability `alpha`), block verification
+    (`verification_law="token"`: token-level) on the raw laws decides the
+    stopping row from fresh randomness, and the token emitted there is the
+    scheme's watermarked sample of the residual law under key B
+    (`dual_key_gumbel`: the key the draft did not use), or of the bonus row
+    under the drafts' key choice. The output follows the model's distribution
+    on average over keys. Detect with `FusedTwoKeyWatermarkDetector` and the
+    run's share of key-A tokens. Needs probabilistic drafting."""
+    truncate_drafts: bool = False
+    """`textseal2` under speculative decoding: race the drafts on the draft
+    law, the drafter's distribution after temperature and then the request's
+    min-p, top-k and top-p (as the reference drafts, and as
+    `block_verified_gumbel` always does), instead of its temperature-only
+    distribution. Needs keyed drafts or `spec_decision="j_only"`."""
     lookahead_reward_samples: int = Field(default=64, ge=2)
     """Size of each of the two reference samples `lookahead_textgrain` draws of
     a child's expected-reward message to calibrate its parent (each costs that
@@ -214,6 +255,8 @@ class WatermarkConfig:
 
     @property
     def supports_speculative_decoding(self) -> bool:
+        if self.two_key_block_verification:
+            return True
         # textGrain verifies drafts against its watermarked distribution.
         return self.algorithm in (
             "dual_key_gumbel",
@@ -230,6 +273,8 @@ class WatermarkConfig:
 
     @property
     def verifies_unwatermarked_drafts(self) -> bool:
+        if self.two_key_block_verification:
+            return False
         # Drafts are sampled without the key and verified against the
         # watermark, so the output stays exact however they are sampled.
         return self.algorithm in (
@@ -279,6 +324,56 @@ class WatermarkConfig:
                 "verification_law='shared' verifies keyed drafts (keyed_drafts=true)"
             )
 
+    def _validate_two_key_block(self) -> None:
+        if not self.two_key_block_verification:
+            return
+        if self.algorithm not in TWO_KEY_BLOCK_ALGORITHMS:
+            raise ValueError(
+                "two_key_block_verification is only defined for "
+                f"{TWO_KEY_BLOCK_ALGORITHMS}"
+            )
+        if self.verification_law not in ("block", "token"):
+            raise ValueError(
+                "two_key_block_verification uses verification_law 'block' or 'token'"
+            )
+        if self.pass_aggregator != "none":
+            raise ValueError("two_key_block_verification has no pass_aggregator")
+
+    def _validate_spec_decision(self) -> None:
+        """The combinations of `textseal2`'s decision rules."""
+        if self.spec_decision == "residual_j" and not self.truncate_drafts:
+            return
+        if self.algorithm != "textseal2":
+            raise ValueError(
+                "spec_decision and truncate_drafts are only defined for textseal2"
+            )
+        if self.verification_law == "token" and self.spec_decision not in (
+            "residual_j",
+            "fresh_stop",
+            "agreement",
+        ):
+            raise ValueError(
+                "token-level verification supports spec_decision in "
+                "('residual_j', 'fresh_stop', 'agreement')"
+            )
+        if self.spec_decision != "residual_j" and self.pass_aggregator != "none":
+            raise ValueError("pass_aggregator applies to spec_decision='residual_j'")
+        if self.spec_decision == "j_only" and self.keyed_drafts:
+            raise ValueError(
+                "spec_decision='j_only' samples the drafts without the key: "
+                "set keyed_drafts=false"
+            )
+        if self.spec_decision not in ("residual_j", "j_only") and not self.keyed_drafts:
+            raise ValueError(f"spec_decision={self.spec_decision!r} needs keyed drafts")
+        if (
+            self.truncate_drafts
+            and not self.keyed_drafts
+            and self.spec_decision != "j_only"
+        ):
+            raise ValueError(
+                "truncate_drafts needs keyed drafts or spec_decision='j_only'"
+            )
+
     @model_validator(mode="after")
     def validate_watermark_settings(self) -> Self:
         if self.key > 2**64 - 1:
@@ -323,9 +418,12 @@ class WatermarkConfig:
                 "verification_law='shared' is only defined for block_verified_gumbel"
             )
         self._validate_block_verified_gumbel()
+        self._validate_spec_decision()
+        self._validate_two_key_block()
         if (
             self.deduplicate_contexts == "strict"
             and self.algorithm not in STRICT_DEDUPLICATION_ALGORITHMS
+            and not self.two_key_block_verification
         ):
             raise ValueError(
                 "deduplicate_contexts='strict' is only implemented for "

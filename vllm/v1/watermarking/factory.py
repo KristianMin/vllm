@@ -50,6 +50,35 @@ def create_watermarker(
     max_num_reqs: int | None = None,
     device: torch.device | None = None,
 ) -> Watermarker:
+    watermarker = _create_watermarker(config, model_config, max_num_reqs, device)
+    if not config.two_key_block_verification:
+        return watermarker
+    from vllm.v1.watermarking.two_key_block import TwoKeyBlockWatermarker
+
+    return TwoKeyBlockWatermarker(
+        watermarker,
+        config.algorithm,
+        config.key,
+        config.context_width,
+        config.prf,
+        law=config.verification_law,
+        alpha=config.alpha,
+        correlation=getattr(watermarker, "correlation", 0.98551),
+        textgrain_args={
+            "entropy_budget": config.entropy_budget,
+            "num_blocks": config.num_blocks,
+            "num_columns": config.num_columns,
+        },
+        synthid_args={"depth": config.depth, "num_leaves": config.num_leaves},
+    )
+
+
+def _create_watermarker(
+    config: WatermarkConfig,
+    model_config: "ModelConfig | None" = None,
+    max_num_reqs: int | None = None,
+    device: torch.device | None = None,
+) -> Watermarker:
     if config.algorithm == "gumbel":
         return GumbelWatermarker(config.key, config.context_width, config.prf)
     if config.algorithm == "block_verified_gumbel":
@@ -200,13 +229,15 @@ def create_watermarker(
             "pass_aggregator": config.pass_aggregator,
             "pass_source": config.pass_source,
         }
-        if config.keyed_drafts:
+        if config.keyed_drafts or config.spec_decision == "j_only":
             return TextSeal2SpeculativeWatermarker(
                 config.key,
                 config.context_width,
                 config.prf,
                 correlation,
                 **speculative_rule,
+                spec_decision=config.spec_decision,
+                truncate_drafts=config.truncate_drafts,
             )
         return TextSeal2VerificationWatermarker(
             config.key,

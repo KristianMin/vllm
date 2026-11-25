@@ -1380,7 +1380,7 @@ class VllmConfig:
                 "gaussian_copula",
                 "rotation_first",
                 "concordmark",
-            ):
+            ) and not watermark_config.two_key_block_verification:
                 raise ValueError(
                     f"The '{watermark_config.algorithm}' watermarking algorithm "
                     "does not support speculative decoding."

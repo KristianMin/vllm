@@ -373,35 +373,23 @@ class BlockVerifiedGumbelDraftWatermarker(GumbelWatermarker):
         )
 
 
-class SampledDraftWatermarker(Watermarker):
-    """The drafter's side of ``keyed_drafts=False``: every watermarked
-    request's draft is a Gumbel-max sample of its draft law on fresh draft
-    noise (``draft_noise_contexts``), which does not depend on the key, so
-    the draft is an exact sample of the draft law, fresh in every round. The
-    other requests draft with vLLM's noise on the temperature-only law."""
+class FreshNoiseDraftWatermarker(Watermarker):
+    """Drafts that do not depend on the key: every watermarked request's
+    draft is a Gumbel-max sample of its draft distribution on fresh draft
+    noise (``draft_noise_contexts``), so the draft is an exact sample of that
+    distribution, fresh in every round (vLLM's own noise repeats at a position
+    drafted again). The other requests draft with vLLM's noise. The draft
+    distribution is the drafter's temperature-only one (``SampledDraftWatermarker``:
+    the draft law)."""
 
     samples_draft_rows = True
 
-    def __init__(
-        self, context_width: int = 4, draft_law_width: int = DRAFT_LAW_WIDTH
-    ) -> None:
-        if draft_law_width < 1:
-            raise ValueError("draft_law_width must be positive")
+    def __init__(self, context_width: int = 4) -> None:
         self._context_width = context_width
-        self.draft_law_width = draft_law_width
 
     @property
     def context_width(self) -> int:
         return self._context_width
-
-    def draft_law_logits(
-        self,
-        logits: torch.Tensor,
-        top_k: torch.Tensor,
-        top_p: torch.Tensor,
-        min_p: torch.Tensor,
-    ) -> torch.Tensor:
-        return draft_law_logits(logits, top_k, top_p, min_p, self.draft_law_width)
 
     def sample_draft_rows(
         self,
@@ -424,7 +412,104 @@ class SampledDraftWatermarker(Watermarker):
         )
 
 
-class BlockVerifiedGumbelVerificationWatermarker(GumbelWatermarker):
+class SampledDraftWatermarker(FreshNoiseDraftWatermarker):
+    """The drafter's side of ``keyed_drafts=False``: every watermarked
+    request's draft is a Gumbel-max sample of its draft law on fresh draft
+    noise (``draft_noise_contexts``), which does not depend on the key, so
+    the draft is an exact sample of the draft law, fresh in every round. The
+    other requests draft with vLLM's noise on the temperature-only law."""
+
+    def __init__(
+        self, context_width: int = 4, draft_law_width: int = DRAFT_LAW_WIDTH
+    ) -> None:
+        if draft_law_width < 1:
+            raise ValueError("draft_law_width must be positive")
+        super().__init__(context_width)
+        self.draft_law_width = draft_law_width
+
+    def draft_law_logits(
+        self,
+        logits: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        min_p: torch.Tensor,
+    ) -> torch.Tensor:
+        return draft_law_logits(logits, top_k, top_p, min_p, self.draft_law_width)
+
+
+class KeyShareCounter:
+    """Running counts of the keyed emitted tokens under key A and key B, for
+    the fused two-key detectors; with the environment variable named by
+    ``_init_key_counts`` set to a path, the counts are kept in that file
+    (JSON). Subclasses call ``_init_key_counts`` and ``_count_keys``."""
+
+    def _init_key_counts(self, env_var: str = KEY_LOG_ENV_VAR) -> None:
+        self.key_log_path = os.environ.get(env_var) or None
+        self._key_counts: torch.Tensor | None = None
+        self._key_pinned: torch.Tensor | None = None
+        self._key_event = None
+        self._key_written: list[int] | None = None
+
+    def _count_keys(self, n_a: torch.Tensor, n_b: torch.Tensor) -> None:
+        """Accumulate the keyed emitted tokens under key A and key B on the
+        device; with ``VLLM_BV_GUMBEL_KEY_LOG``, refresh the log file."""
+        counts = torch.stack([n_a.long(), n_b.long()])
+        self._key_counts = (
+            counts if self._key_counts is None else self._key_counts + counts
+        )
+        if self.key_log_path is not None:
+            self._flush_key_log()
+
+    def _flush_key_log(self, sync: bool = False) -> None:
+        """Write the running counts to ``key_log_path``. On CUDA without a
+        host synchronization: the counts go to a pinned buffer by a
+        non-blocking copy, which a later call writes out once its event has
+        completed (so the file lags by a call or two)."""
+        counts = self._key_counts
+        if counts is None:
+            return
+        if sync or counts.device.type != "cuda":
+            self._write_key_log([int(v) for v in counts.tolist()])
+            return
+        if self._key_event is not None and self._key_event.query():
+            assert self._key_pinned is not None
+            self._write_key_log([int(v) for v in self._key_pinned.tolist()])
+            self._key_event = None
+        if self._key_event is None:
+            if self._key_pinned is None:
+                self._key_pinned = torch.zeros(2, dtype=torch.long, pin_memory=True)
+            self._key_pinned.copy_(counts, non_blocking=True)
+            self._key_event = torch.cuda.Event()
+            self._key_event.record(torch.cuda.current_stream(counts.device))
+
+    def _write_key_log(self, values: list[int]) -> None:
+        if values == self._key_written or self.key_log_path is None:
+            return
+        tmp = f"{self.key_log_path}.tmp{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump(
+                {
+                    "key_a": values[0],
+                    "key_b": values[1],
+                    "pid": os.getpid(),
+                    "time": time.time(),
+                },
+                f,
+            )
+        os.replace(tmp, self.key_log_path)
+        self._key_written = values
+
+    def key_share_stats(self) -> tuple[int, int]:
+        """(keyed emitted tokens under key A, under key B) since construction
+        (synchronizes)."""
+        if self._key_counts is None:
+            return 0, 0
+        n_a, n_b = (int(v) for v in self._key_counts.tolist())
+        return n_a, n_b
+
+
+
+class BlockVerifiedGumbelVerificationWatermarker(GumbelWatermarker, KeyShareCounter):
     """The verifier's side; without speculation it samples like ``gumbel``.
 
     ``draft_law_verification_logits`` decides each round of the keyed drafts
@@ -476,14 +561,10 @@ class BlockVerifiedGumbelVerificationWatermarker(GumbelWatermarker):
         self.strict = os.environ.get(STRICT_ENV_VAR, "0") == "1"
         self.report_every = int(os.environ.get(REPORT_EVERY_ENV_VAR, "1000"))
         self.compile_race = os.environ.get(COMPILE_ENV_VAR, "0") == "1"
-        self.key_log_path = os.environ.get(KEY_LOG_ENV_VAR) or None
+        self._init_key_counts()
         self._generators: dict[torch.device, torch.Generator] = {}
         self._counts: torch.Tensor | None = None
         self._calls = 0
-        self._key_counts: torch.Tensor | None = None
-        self._key_pinned: torch.Tensor | None = None
-        self._key_event = None
-        self._key_written: list[int] | None = None
 
     def sample(
         self,
@@ -917,64 +998,6 @@ class BlockVerifiedGumbelVerificationWatermarker(GumbelWatermarker):
 
     # ---- plain block verification: the keys' shares --------------------------
 
-    def _count_keys(self, n_a: torch.Tensor, n_b: torch.Tensor) -> None:
-        """Accumulate the keyed emitted tokens under key A and key B on the
-        device; with ``VLLM_BV_GUMBEL_KEY_LOG``, refresh the log file."""
-        counts = torch.stack([n_a.long(), n_b.long()])
-        self._key_counts = (
-            counts if self._key_counts is None else self._key_counts + counts
-        )
-        if self.key_log_path is not None:
-            self._flush_key_log()
-
-    def _flush_key_log(self, sync: bool = False) -> None:
-        """Write the running counts to ``key_log_path``. On CUDA without a
-        host synchronization: the counts go to a pinned buffer by a
-        non-blocking copy, which a later call writes out once its event has
-        completed (so the file lags by a call or two)."""
-        counts = self._key_counts
-        if counts is None:
-            return
-        if sync or counts.device.type != "cuda":
-            self._write_key_log([int(v) for v in counts.tolist()])
-            return
-        if self._key_event is not None and self._key_event.query():
-            assert self._key_pinned is not None
-            self._write_key_log([int(v) for v in self._key_pinned.tolist()])
-            self._key_event = None
-        if self._key_event is None:
-            if self._key_pinned is None:
-                self._key_pinned = torch.zeros(2, dtype=torch.long, pin_memory=True)
-            self._key_pinned.copy_(counts, non_blocking=True)
-            self._key_event = torch.cuda.Event()
-            self._key_event.record(torch.cuda.current_stream(counts.device))
-
-    def _write_key_log(self, values: list[int]) -> None:
-        if values == self._key_written or self.key_log_path is None:
-            return
-        tmp = f"{self.key_log_path}.tmp{os.getpid()}"
-        with open(tmp, "w") as f:
-            json.dump(
-                {
-                    "key_a": values[0],
-                    "key_b": values[1],
-                    "pid": os.getpid(),
-                    "time": time.time(),
-                },
-                f,
-            )
-        os.replace(tmp, self.key_log_path)
-        self._key_written = values
-
-    def key_share_stats(self) -> tuple[int, int]:
-        """(keyed emitted tokens under key A, under key B) since construction
-        (``residual_race=False``; synchronizes)."""
-        if self._key_counts is None:
-            return 0, 0
-        n_a, n_b = (int(v) for v in self._key_counts.tolist())
-        return n_a, n_b
-
-
 def _check_rule(
     law: str,
     pass_aggregator: str,
@@ -1406,6 +1429,8 @@ __all__ = [
     "FusedWatermarkDetection",
     "KEY_B_DOMAIN",
     "KEY_LOG_ENV_VAR",
+    "KeyShareCounter",
+    "FreshNoiseDraftWatermarker",
     "SampledDraftWatermarker",
     "TARGET_SLOTS",
     "VERIFICATION_LAWS",

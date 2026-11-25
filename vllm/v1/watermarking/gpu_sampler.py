@@ -245,7 +245,7 @@ class GPUWatermarkSampler(Sampler):
             row_draft_logits = draft_logits[
                 requests, steps, : processed_logits.shape[-1]
             ].float() / temperatures.unsqueeze(-1)
-            return self.watermarker.residual_verification_logits(
+            verification_logits = self.watermarker.residual_verification_logits(
                 processed_logits,
                 contexts,
                 draft_sampled.roll(-1),
@@ -260,6 +260,11 @@ class GPUWatermarkSampler(Sampler):
                     use_fp64=self.use_fp64_gumbel,
                 ),
             )
+            if evaluated is not None:
+                evaluated.commit(
+                    contexts, expanded_idx_mapping, expanded_local_pos, evaluated_rows
+                )
+            return verification_logits
         verification_logits = self.watermarker.verification_logits(
             processed_logits,
             contexts,
