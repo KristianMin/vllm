@@ -363,3 +363,99 @@ def test_fused_detector_null_is_calibrated(algorithm):
         for _ in range(300)
     ]
     assert stats.kstest(p_values, "uniform").pvalue > 1e-3
+
+
+# ---- CUDA: the same decisions as on the CPU ---------------------------------
+
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
+
+def _random_round(B=48, n=4, V=40, seed=0, device="cpu"):
+    gen = torch.Generator().manual_seed(seed)
+    D = n + 1
+    P = torch.softmax(torch.randn(B, D, V, generator=gen, dtype=torch.float64) * 2, -1)
+    Q = torch.softmax(torch.randn(B, D, V, generator=gen, dtype=torch.float64) * 2, -1)
+    P = torch.where(torch.rand(B, D, V, generator=gen) < 0.2, 0.0, P)
+    P = P / P.sum(-1, keepdim=True)
+    K = torch.randint(0, n + 1, (B,), generator=gen)
+    is_draft = torch.arange(D).unsqueeze(0) < K.unsqueeze(1)
+    Q = Q * is_draft.unsqueeze(-1)
+    E = torch.empty(B, D, V, dtype=torch.float64).exponential_(generator=gen)
+    d = torch.argmin(torch.where(Q > 0, E / Q.clamp(min=1e-300), torch.inf), -1)
+    d = torch.where(is_draft, d, 0)
+    u = torch.rand(B, D, 2, generator=gen, dtype=torch.float64)
+    F = torch.empty(B, D, V, dtype=torch.float64).exponential_(generator=gen)
+    keyed = torch.rand(B, D, generator=gen) < 0.7
+    return [x.to(device) for x in (E, P, Q, d, K, u, F, keyed)]
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "decision, law",
+    [(d, "block") for d in DECISIONS] + [(d, "token") for d in ("residual_j", "fresh_stop", "agreement")],
+)
+def test_decide_cuda_matches_cpu(decision, law):
+    E, P, Q, d, K, u, F, keyed = _random_round()
+    want = verification.decide(decision, E, P, Q, d, K, law, keyed=keyed, u=u, F=F)
+    E, P, Q, d, K, u, F, keyed = _random_round(device="cuda")
+    got = verification.decide(decision, E, P, Q, d, K, law, keyed=keyed, u=u, F=F)
+    assert torch.equal(want[0], got[0].cpu()) and torch.equal(want[1], got[1].cpu())
+
+
+def _verification_inputs(device, V=64, sizes=(3, 1, 6, 4), width=4, seed=1):
+    from vllm.v1.watermarking.watermarker import RandomSampler
+
+    gen = torch.Generator().manual_seed(seed)
+    rows = sum(sizes)
+    logits = torch.randn(rows, V, generator=gen) * 2
+    draft_law = torch.randn(rows, V, generator=gen) * 2
+    draft_law = torch.where(torch.rand(rows, V, generator=gen) < 0.3, float("-inf"), draft_law)
+    contexts = torch.randint(0, V, (rows, width), generator=gen)
+    contexts[0, 0] = -1  # a partial context
+    drafts = torch.randint(0, V, (rows,), generator=gen)
+    cu = torch.tensor([0] + list(itertools.accumulate(sizes)), dtype=torch.int32)
+    request = torch.repeat_interleave(torch.arange(len(sizes)), torch.tensor(sizes))
+    enabled = torch.tensor([True, True, False, True])[request]
+    repeated = torch.rand(rows, generator=gen) < 0.2
+    seeds = torch.randint(0, 2**62, (len(sizes),), generator=gen)
+    positions = torch.arange(rows) + 7
+    sampler = RandomSampler(
+        expanded_idx_mapping=request.to(torch.int32).to(device),
+        temperatures=torch.ones(len(sizes), device=device),
+        seeds=seeds.to(device),
+        positions=positions.to(device),
+    )
+    tensors = [x.to(device) for x in (logits, contexts, drafts, cu, enabled, repeated, draft_law)]
+    return tensors, sampler
+
+
+@requires_cuda
+@pytest.mark.parametrize("decision", ["residual_j", "fresh_stop", "tau_stop", "agreement", "j_only"])
+def test_textseal2_draft_law_verifier_cuda_matches_cpu(decision):
+    verifier = TextSeal2DraftLawVerificationWatermarker(
+        11, 4, correlation=0.9, keyed_drafts=decision != "j_only", spec_decision=decision
+    )
+    out = []
+    for device in ("cpu", "cuda"):
+        tensors, sampler = _verification_inputs(device)
+        out.append(verifier.draft_law_verification_logits(*tensors, sampler).cpu())
+    assert torch.equal(out[0].isfinite(), out[1].isfinite())
+    raced = out[0].isfinite().sum(-1) == 1
+    assert torch.equal(out[0].argmax(-1)[raced], out[1].argmax(-1)[raced])
+
+
+@requires_cuda
+@pytest.mark.parametrize("algorithm", ["dual_key_gumbel", "gaussian_copula", "synthid", "textgrain"])
+def test_two_key_block_cuda_matches_cpu(algorithm):
+    config = WatermarkConfig(key=7, algorithm=algorithm, two_key_block_verification=True,
+                             alpha=0.5, num_blocks=4, num_columns=4)
+    out = []
+    for device in ("cpu", "cuda"):
+        wm = create_watermarker(config)
+        tensors, sampler = _verification_inputs(device)
+        out.append(wm.target_watermarker.draft_law_verification_logits(*tensors, sampler).cpu())
+    raced = out[0].isfinite().sum(-1) == 1
+    assert torch.equal(raced, out[1].isfinite().sum(-1) == 1)
+    agree = (out[0].argmax(-1)[raced] == out[1].argmax(-1)[raced]).double().mean()
+    # textGrain's and SynthID's CUDA kernels round differently from torch.
+    assert agree >= (1.0 if algorithm in ("dual_key_gumbel", "gaussian_copula") else 0.9), agree
