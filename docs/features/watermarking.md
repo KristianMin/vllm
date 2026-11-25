@@ -120,7 +120,8 @@ output tokens supplied by accepted drafts; rejected drafts do not dilute it
 because their recovery tokens are watermarked. The `red_green` is not diluted, as its
 verification uses the watermarked logits from the target model (see [Red-Green](#red-green-red-green-list)).
 `multibit_red_green` and `synthid` are rejected even with
-`allow_target_only_watermarking`.
+`allow_target_only_watermarking` (`synthid` and `gaussian_copula` support
+[two-key block verification](#two-key-block-verification)).
 `textgrain` verifies drafts against its watermarked distribution in the same
 way and needs no `allow_target_only_watermarking` (see [textGrain](#textgrain)).
 
@@ -147,10 +148,13 @@ context:
 - `"none"` disables context deduplication.
 - `"single_turn"`, the default, searches the tokens generated for the current
   request. This gives single-turn non-distortion.
-- `"strict"` (`lookahead_gumbel` and `block_verified_gumbel` only) searches
+- `"strict"` (`lookahead_gumbel`, `block_verified_gumbel`, `textseal2` and the
+  [two-key block baselines](#two-key-block-verification)) searches
   like `"single_turn"` and also counts as repeated every context an earlier
   speculative verification step of the request evaluated, including rows past
   the first rejection (see [Block-verified Gumbel-max](#block-verified-gumbel-max)).
+  This is the TextSeal2 reference implementation's rule under block
+  verification.
 - `"all"` also searches the prompt, which extends non-distortion across the
   turns of a conversation. The first `context_width` generated tokens use
   ordinary sampling, and subsequent tokens whose context already occurs in the
@@ -536,7 +540,8 @@ from vllm.v1.watermarking import SynthIDWatermarkDetector
 result = SynthIDWatermarkDetector(key=42, depth=30).detect(token_ids)
 ```
 
-SynthID-Text does not support [speculative decoding](#speculative-decoding).
+SynthID-Text supports [speculative decoding](#speculative-decoding) only with
+[two-key block verification](#two-key-block-verification).
 
 ### Gaussian copula
 
@@ -597,8 +602,9 @@ result = detector.detect(token_ids)
 The same weighted tests detect Gumbel-max watermarks (`gumbel`, `lookahead_gumbel`) with
 `WeightedGumbelWatermarkDetector`, over the positions `GumbelWatermarkDetector` scores.
 
-The Gaussian copula watermark does not support
-[speculative decoding](#speculative-decoding).
+The Gaussian copula watermark supports
+[speculative decoding](#speculative-decoding) only with
+[two-key block verification](#two-key-block-verification).
 
 ### TextSeal2
 
@@ -657,6 +663,87 @@ recursion on TextSeal2's noise instead, with `aggregator` and
 clocks of rows they then discard, so `context_width` should be at least
 `num_speculative_tokens`.
 
+`spec_decision` selects the decision rule of a round among those of the
+[TextSeal2 reference implementation](https://github.com/facebookresearch/textseal)
+(its `spec_decision`); every rule keeps the model's distribution and the
+acceptance of its verification law. With `verification_law` `"block"`:
+
+| `spec_decision` | Reference | Rule |
+|---|---|---|
+| `residual_j` (default) | `residj` | the paper's residual race on the leftovers |
+| `fresh_stop` | `ts2b` | the stopping row from fresh randomness, the token from the leftover race at that row |
+| `tau_stop` | `taub` | the stopping row from the draft races' times (block verification's backward rule on `1 - exp(-tau)`), the token from the leftover race |
+| `agreement` | `agreeb` | plain decoding on the drafts' clocks (each row's own race, stopping at the first that disagrees with its draft), kept with probability `min(1, pi / P*)`, else a race on the remaining mass |
+| `j_only` | `jonly` | drafts sampled from the draft distribution without the key (`keyed_drafts: false`), the race on the raw clocks |
+| `raw_j` | `residjraw` | keyed drafts raced on the raw clocks: the reference's biased negative control, not exact |
+
+With `"token"`: `residual_j`, `fresh_stop` (the reference's token rule
+`residual`: a fresh accept coin per row, the leftover race at the first
+rejection) and `agreement` (its race coupling of the draft race and the
+target's race, with fresh coins). `pass_aggregator` applies to `residual_j`
+only. The fresh randomness is a public PRF of the request seed, the row's
+position and its draft step. `truncate_drafts: true` races the drafts on the
+draft law, the drafter's distribution after temperature and then the request's
+min-p, top-k and top-p, as the reference drafts, instead of the
+temperature-only distribution. The reference's runs correspond to:
+
+```bash
+vllm serve MODEL \
+  --speculative-config \
+  '{"method":"mtp","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}' \
+  --watermark-config '{"algorithm":"textseal2","key":42,"spec_decision":"tau_stop",
+                       "truncate_drafts":true,"deduplicate_contexts":"strict"}'
+```
+
+The reference marks every keyed row a round read as used, which is
+`"deduplicate_contexts": "strict"`; with `single_turn`, the rules that read the
+clocks of rows past the stopping row (`residual_j`, `fresh_stop`, `agreement`)
+are exact only for `context_width` at least `num_speculative_tokens`.
+
+### Two-key block verification
+
+`"two_key_block_verification": true` gives `dual_key_gumbel`,
+`gaussian_copula`, `textgrain` and `synthid` the speculative baseline of the
+TextSeal2 reference implementation (its `textseal`, `automark`, `textgrain` and
+`synthid` under block verification). Each draft is the scheme's watermarked
+sample of the draft law (truncated like the target) under key A
+(`dual_key_gumbel`: key B with probability `alpha`, the reference's
+`mixing_alpha` being `1 - alpha`). Block verification on the raw laws
+(`verification_law: "token"` for token-level verification) draws the stopping
+row with fresh randomness, and the token emitted there is the scheme's
+watermarked sample of the residual law under key B (`dual_key_gumbel`: the key
+the draft did not use), or at the bonus row the scheme's sample of the target
+under the drafts' key choice. The output follows the model's distribution on
+average over keys, and the acceptance is that of block verification with the
+draft law. Repeated contexts and the first `context_width` tokens are sampled
+without the watermark under either key (the reference tracks each
+(context, key) pair). Without speculation the algorithm samples as usual.
+
+```bash
+vllm serve MODEL \
+  --speculative-config \
+  '{"method":"mtp","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}' \
+  --watermark-config '{"algorithm":"synthid","key":42,"two_key_block_verification":true,
+                       "deduplicate_contexts":"strict"}'
+```
+
+Tokens carry key A or key B, so detection fuses both keys with the run's share
+`a` of key-A tokens among the keyed emitted tokens, which the verifier counts
+(`key_share_stats()`, or the file named by `VLLM_TWO_KEY_BLOCK_KEY_LOG`):
+
+```python
+from vllm.v1.watermarking import FusedTwoKeyWatermarkDetector
+
+detector = FusedTwoKeyWatermarkDetector("synthid", key=42, key_share_a=0.74)
+result = detector.detect(token_ids)
+```
+
+Each scored pair scores `a s_A + (1 - a) s_B`, `s_K` the scheme's score under
+key K (`dual_key_gumbel` and `gaussian_copula`: the Gumbel score of the key's
+uniform; `textgrain`: its cell score; `synthid`: its g-value count), with the
+exact p-value of the sum. Key A is the algorithm's key (`dual_key_gumbel`: its
+key A) and key B is derived from the master key.
+
 ### Block-verified Gumbel-max
 
 `block_verified_gumbel` is Gumbel-max (`gumbel`'s key, PRF and contexts; without
@@ -707,8 +794,7 @@ the acceptance of its verification law, the same for every aggregator.
 `a s_A + (1 - a) s_B` of both keys with the exact p-value of the sum), whose
 weight `a` is the run's share of key-A tokens; the verifier counts them, and
 with `VLLM_BV_GUMBEL_KEY_LOG=<path>` writes the running counts to that file.
-With `"deduplicate_contexts": "strict"` (`lookahead_gumbel` and
-`block_verified_gumbel`), a context that any row of an earlier verification step
+With `"deduplicate_contexts": "strict"`, a context that any row of an earlier verification step
 of the request evaluated counts as repeated too: the lookahead and residual
 races read the keyed clocks of rows past the first rejection, and `strict`
 keeps them from being raced on again, so the output stays exact (with
