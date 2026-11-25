@@ -18,6 +18,12 @@ from vllm.v1.watermarking.concordmark import (
     ConcordMarkWatermarker,
 )
 from vllm.v1.watermarking.detector import WatermarkDetection, WatermarkDetector
+from vllm.v1.watermarking.dipmark_morphmark import (
+    DiPMarkWatermarkDetector,
+    DiPMarkWatermarker,
+    MorphMarkWatermarkDetector,
+    MorphMarkWatermarker,
+)
 from vllm.v1.watermarking.factory import create_watermarker
 from vllm.v1.watermarking.gaussian_copula import (
     GaussianCopulaWatermarkDetector,
@@ -101,6 +107,8 @@ __all__ = [
     "BlockVerifiedGumbelVerificationWatermarker",
     "BlockVerifiedGumbelWatermarker",
     "ChiSquaredWatermarker",
+    "DiPMarkWatermarkDetector",
+    "DiPMarkWatermarker",
     "DualKeyGumbelWatermarkDetector",
     "FusedTwoKeyGumbelWatermarkDetector",
     "FusedWatermarkDetection",
@@ -122,6 +130,8 @@ __all__ = [
     "PPLHardWatermarker",
     "PPLSoftWatermarker",
     "LocalizedWatermarkDetection",
+    "MorphMarkWatermarkDetector",
+    "MorphMarkWatermarker",
     "PhiloxPRF",
     "RotationFirstWatermarkDetector",
     "RotationFirstWatermarker",

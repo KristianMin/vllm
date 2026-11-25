@@ -9,6 +9,10 @@ from vllm.config.watermarking import WatermarkConfig
 from vllm.v1.watermarking.block_verified_gumbel import BlockVerifiedGumbelWatermarker
 from vllm.v1.watermarking.chi_squared import ChiSquaredWatermarker
 from vllm.v1.watermarking.concordmark import ConcordMarkWatermarker
+from vllm.v1.watermarking.dipmark_morphmark import (
+    DiPMarkWatermarker,
+    MorphMarkWatermarker,
+)
 from vllm.v1.watermarking.gaussian_copula import (
     DEFAULT_CORRELATION as COPULA_DEFAULT_CORRELATION,
 )
@@ -123,6 +127,23 @@ def _create_watermarker(
             config.prf,
             gamma=0.5 if config.gamma is None else config.gamma,
             **delta,
+        )
+    if config.algorithm == "dipmark":
+        return DiPMarkWatermarker(
+            config.key,
+            config.context_width,
+            config.prf,
+            alpha=config.dipmark_alpha,
+            gamma=0.5 if config.gamma is None else config.gamma,
+        )
+    if config.algorithm == "morphmark":
+        return MorphMarkWatermarker(
+            config.key,
+            config.context_width,
+            config.prf,
+            k=config.morphmark_k,
+            p_0=config.morphmark_p0,
+            gamma=0.5 if config.gamma is None else config.gamma,
         )
     if config.algorithm == "multibit_red_green":
         return MultibitRedGreenWatermarker(
